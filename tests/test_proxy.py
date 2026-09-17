@@ -29,6 +29,11 @@ def gateway(upstream_url: str) -> Iterator[str]:
         "QUOTAGATE_UPSTREAM_KEY": "not-a-real-key",
         "QUOTAGATE_UPSTREAM_NAME": "fake",
         "QUOTAGATE_KEYS": KEYS,
+        # The limiter has its own tests; keep it out of the way here.
+        "QUOTAGATE_KEY_RPM": "1000",
+        "QUOTAGATE_KEY_TPM": "1000000",
+        "QUOTAGATE_ACCOUNT_RPM": "1000",
+        "QUOTAGATE_ACCOUNT_TPM": "1000000",
     }
     with running("app:app", env=env) as url:
         yield url

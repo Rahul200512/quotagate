@@ -19,8 +19,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 
 from quotagate import __version__, upstream
 from quotagate.page import INDEX_HTML
+from quotagate.config import limits as limit_settings
 from quotagate.config import settings
 from quotagate.keys import ApiKey, bearer_token, find, parse_keys
+from quotagate.limits import Buckets, InMemoryBuckets, Limit, Scope, estimate_cost
+from quotagate.redis_buckets import RedisBuckets, RestTransport, TcpTransport
 from quotagate.requestlog import RequestRecord
 from quotagate.upstream import UpstreamUnavailable
 
@@ -38,14 +41,41 @@ MAX_GAP_MS = 2_000
 MAX_BODY_BYTES = 256 * 1024
 
 
+KEY_LIMIT = Limit(limit_settings.key_rpm, limit_settings.key_tpm)
+ACCOUNT_LIMIT = Limit(limit_settings.account_rpm, limit_settings.account_tpm)
+
+
+def build_buckets() -> Buckets:
+    """Shared buckets when Redis is configured, per-process ones when not.
+
+    The in-memory fallback is not a degraded mode of the same guarantee — it is
+    a different, weaker one, so `/healthz` reports which is in force rather than
+    letting a missing environment variable quietly halve the limits' meaning.
+    """
+    if limit_settings.redis_rest_url and limit_settings.redis_rest_token:
+        return RedisBuckets(
+            RestTransport(limit_settings.redis_rest_url, limit_settings.redis_rest_token)
+        )
+    if limit_settings.redis_url:
+        return RedisBuckets(TcpTransport(limit_settings.redis_url))
+    return InMemoryBuckets()
+
+
+def scopes_for(key: ApiKey) -> list[Scope]:
+    # The caller's own ceiling, then the provider account everybody shares.
+    return [Scope(f"key:{key.name}", KEY_LIMIT), Scope("account", ACCOUNT_LIMIT)]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.upstream = upstream.build_client(settings)
     app.state.keys = parse_keys(settings.keys_raw)
+    app.state.buckets = build_buckets()
     try:
         yield
     finally:
         await app.state.upstream.aclose()
+        await app.state.buckets.aclose()
 
 
 app = FastAPI(title="quotagate", version=__version__, docs_url="/docs", lifespan=lifespan)
@@ -89,6 +119,16 @@ async def healthz() -> JSONResponse:
             "upstream": settings.upstream_name,
             "upstream_key_configured": settings.has_upstream_key,
             "keys_configured": len(app.state.keys) if hasattr(app.state, "keys") else 0,
+            "limits": {
+                # "per-process" is a weaker promise than "shared", so it is
+                # reported rather than hidden behind the same word.
+                "scope": "shared" if limit_settings.shared else "per-process",
+                "key_rpm": KEY_LIMIT.requests_per_minute,
+                "key_tpm": KEY_LIMIT.tokens_per_minute,
+                "account_rpm": ACCOUNT_LIMIT.requests_per_minute,
+                "account_tpm": ACCOUNT_LIMIT.tokens_per_minute,
+                "on_limiter_failure": "allow" if limit_settings.fail_open else "refuse",
+            },
         }
     )
 
@@ -109,7 +149,45 @@ async def chat_completions(request: Request) -> Response:
     if not isinstance(payload, dict) or not payload.get("model") or not payload.get("messages"):
         return error(400, "invalid_request", "`model` and `messages` are required")
 
+    scopes = scopes_for(key)
+    buckets: Buckets = request.app.state.buckets
+    reserved = estimate_cost(payload)
+    try:
+        decision = await buckets.take(scopes, reserved)
+    except Exception as exc:  # Redis unreachable, timing out, or refusing
+        if not limit_settings.fail_open:
+            # Refusing costs this caller a request. Allowing costs the provider
+            # budget that every caller shares, and that is the worse trade.
+            return error(
+                503,
+                "limiter_unavailable",
+                f"rate limiter is unreachable ({type(exc).__name__}); request refused",
+                {"retry-after": "5"},
+            )
+        decision = None
+
+    if decision is not None and not decision.allowed:
+        return error(
+            429,
+            "rate_limit_exceeded",
+            f"rate limit reached for {decision.bound_by}",
+            decision.headers(KEY_LIMIT),
+        )
+
     wants_stream = bool(payload.get("stream"))
+    if wants_stream and "stream_options" not in payload:
+        # Without this the provider sends no usage frame, and every streamed
+        # call would settle against an estimate instead of the real cost. The
+        # caller sees one extra final frame, which OpenAI's own clients expect.
+        payload["stream_options"] = {"include_usage": True}
+
+    async def settle(completed: RequestRecord) -> None:
+        if decision is None or not decision.reserved:
+            return
+        actual = (completed.prompt_tokens or 0) + (completed.completion_tokens or 0)
+        if actual:
+            await buckets.reconcile(scopes, decision.reserved, actual)
+
     record = RequestRecord(
         key_name=key.name,
         model=str(payload.get("model")),
@@ -145,11 +223,13 @@ async def chat_completions(request: Request) -> Response:
                 headers,
             )
 
+    limit_headers = decision.headers(KEY_LIMIT) if decision is not None else {}
+
     if wants_stream:
         return StreamingResponse(
-            upstream.relay(response, record, started),
+            upstream.relay(response, record, started, on_finish=settle),
             media_type="text/event-stream",
-            headers=STREAM_HEADERS,
+            headers={**STREAM_HEADERS, **limit_headers},
         )
 
     body = await response.aread()
@@ -167,7 +247,8 @@ async def chat_completions(request: Request) -> Response:
     record.completion_tokens = usage.get("completion_tokens")
     record.finish(response.status_code, "ok", started)
     record.emit()
-    return JSONResponse(parsed, status_code=response.status_code)
+    await settle(record)
+    return JSONResponse(parsed, status_code=response.status_code, headers=limit_headers)
 
 
 @app.get("/v1/models")
@@ -184,6 +265,38 @@ async def models(request: Request) -> Response:
         return JSONResponse(response.json(), status_code=response.status_code)
     except ValueError:
         return error(502, "upstream_malformed", "provider returned a body that is not JSON")
+
+
+@app.post("/debug/limit-check")
+async def limit_check(request: Request, cost: int = Query(1, ge=1, le=100_000)) -> Response:
+    """Spend budget without calling the provider.
+
+    The limiter decision is the thing being measured, and running it through
+    real completions would mean burning a free-tier quota to find out whether
+    the quota is being enforced. This takes the same path — same scopes, same
+    buckets, same headers — and stops before the provider call.
+    """
+    key = authenticate(request)
+    if isinstance(key, JSONResponse):
+        return key
+
+    scopes = scopes_for(key)
+    try:
+        decision = await request.app.state.buckets.take(scopes, cost)
+    except Exception as exc:
+        return error(503, "limiter_unavailable", f"{type(exc).__name__}", {"retry-after": "5"})
+
+    status = 200 if decision.allowed else 429
+    return JSONResponse(
+        {
+            "allowed": decision.allowed,
+            "bound_by": decision.bound_by,
+            "reserved": decision.reserved,
+            "shared": limit_settings.shared,
+        },
+        status_code=status,
+        headers=decision.headers(KEY_LIMIT),
+    )
 
 
 async def _ticks(chunks: int, gap_ms: int) -> AsyncIterator[str]:

@@ -22,8 +22,16 @@ default for Python. The probe is what makes that claim checkable, and the whole
 hosting choice depends on it. If the deployed verdict comes back `BUFFERED`,
 the gateway moves to Render and the Vercel project keeps only the front page.
 
-## v1 — limits that hold across copies
+## v1 — limits that hold across copies (in progress)
 
+- [x] Token buckets with reserve-and-reconcile, per-key and per-account, decided
+      together in one operation
+- [x] Per-process baseline kept and measured: two copies admit twice the limit
+- [x] `/debug/limit-check` so enforcement can be measured without spending quota
+- [x] Fail-closed when the limiter is unreachable; `/healthz` reports which
+      promise is in force
+- [ ] The Lua script run against a real Redis, and the shared-limit row filled in
+- [ ] Upstash account, then the same measurement against the deployment
 - Token bucket in Upstash Redis, evaluated in one atomic script
 - Per-key requests/minute and tokens/minute; reserve an estimate, reconcile
   against real usage from the response

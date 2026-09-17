@@ -1,0 +1,36 @@
+# Three copies of the gateway, so a limit can be tested the way production
+# breaks it: with more than one process holding an opinion about the budget.
+#
+#   docker compose up -d --build            # per-process buckets (the baseline)
+#   SHARED=redis://redis:6379 docker compose up -d --build   # shared buckets
+#
+# Each copy is capped at 256 MB so three of them plus Redis stay well inside
+# the 4 GB this laptop gives Docker.
+
+x-gateway: &gateway
+  build: .
+  environment:
+    QUOTAGATE_KEYS: ${QUOTAGATE_KEYS:?run scripts/new_key.py and export QUOTAGATE_KEYS}
+    QUOTAGATE_REDIS_URL: ${SHARED:-}
+    QUOTAGATE_KEY_RPM: ${KEY_RPM:-10}
+    QUOTAGATE_KEY_TPM: ${KEY_TPM:-100000}
+    QUOTAGATE_ACCOUNT_RPM: ${ACCOUNT_RPM:-1000}
+    QUOTAGATE_ACCOUNT_TPM: ${ACCOUNT_TPM:-1000000}
+  depends_on: [redis]
+  mem_limit: 256m
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb"]
+    mem_limit: 128m
+
+  copy1:
+    <<: *gateway
+    ports: ["8101:8000"]
+  copy2:
+    <<: *gateway
+    ports: ["8102:8000"]
+  copy3:
+    <<: *gateway
+    ports: ["8103:8000"]

@@ -46,3 +46,49 @@ def load() -> Settings:
 
 
 settings = load()
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+@dataclass(frozen=True)
+class LimitSettings:
+    """Ceilings, and what to do when the limiter itself is unreachable."""
+
+    key_rpm: int
+    key_tpm: int
+    # Groq's free tier is 8,000 tokens/minute for the *account*, so the
+    # account ceiling sits below it, leaving room for the estimate to be wrong.
+    account_rpm: int
+    account_tpm: int
+    redis_rest_url: str | None
+    redis_rest_token: str | None
+    redis_url: str | None
+    # Default closed: if the limiter cannot be consulted, refusing costs a
+    # request, while allowing costs the provider budget everyone shares.
+    fail_open: bool
+
+    @property
+    def shared(self) -> bool:
+        return bool((self.redis_rest_url and self.redis_rest_token) or self.redis_url)
+
+
+def load_limits() -> LimitSettings:
+    return LimitSettings(
+        key_rpm=_int_env("QUOTAGATE_KEY_RPM", 10),
+        key_tpm=_int_env("QUOTAGATE_KEY_TPM", 6_000),
+        account_rpm=_int_env("QUOTAGATE_ACCOUNT_RPM", 25),
+        account_tpm=_int_env("QUOTAGATE_ACCOUNT_TPM", 7_000),
+        redis_rest_url=os.environ.get("QUOTAGATE_REDIS_REST_URL") or None,
+        redis_rest_token=os.environ.get("QUOTAGATE_REDIS_REST_TOKEN") or None,
+        redis_url=os.environ.get("QUOTAGATE_REDIS_URL") or None,
+        fail_open=os.environ.get("QUOTAGATE_FAIL_OPEN", "").lower() in {"1", "true", "yes"},
+    )
+
+
+limits = load_limits()

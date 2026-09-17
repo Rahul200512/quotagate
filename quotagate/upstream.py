@@ -16,13 +16,19 @@ Two things here are deliberate and both matter later:
 
 from __future__ import annotations
 
+import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 import httpx
 
 from quotagate.config import Settings
 from quotagate.requestlog import RequestRecord
+
+
+# Enough to hold the last few SSE frames, where usage lives; small enough that
+# a long reply is never accumulated in memory.
+TAIL_BYTES = 8 * 1024
 
 
 class UpstreamUnavailable(Exception):
@@ -80,10 +86,31 @@ async def open_stream(
         raise UpstreamUnavailable(f"{settings.upstream_name} failed: {exc!r}", 502) from exc
 
 
+def usage_from_tail(tail: bytes) -> dict | None:
+    """Find the usage block a provider puts in its final streamed frames.
+
+    Only the tail is kept — a few kilobytes — because holding the whole
+    response to read its last frame would undo the point of streaming.
+    """
+    for line in reversed(tail.split(b"\n")):
+        line = line.strip()
+        if not line.startswith(b"data: ") or line == b"data: [DONE]":
+            continue
+        try:
+            frame = json.loads(line[6:])
+        except json.JSONDecodeError:
+            continue  # a truncated first frame in the tail window
+        usage = frame.get("usage") or (frame.get("x_groq") or {}).get("usage")
+        if isinstance(usage, dict) and usage.get("total_tokens") is not None:
+            return usage
+    return None
+
+
 async def relay(
     response: httpx.Response,
     record: RequestRecord,
     started: float,
+    on_finish: Callable[[RequestRecord], Awaitable[None]] | None = None,
 ) -> AsyncIterator[bytes]:
     """Hand provider bytes to the caller as they arrive, then log.
 
@@ -92,6 +119,7 @@ async def relay(
     away actually stops the work instead of paying for tokens nobody reads.
     """
     outcome = "ok"
+    tail = b""
     try:
         async for chunk in response.aiter_raw():
             if not chunk:
@@ -100,6 +128,7 @@ async def relay(
                 record.first_byte_ms = round((time.perf_counter() - started) * 1000, 1)
             record.chunks += 1
             record.bytes_out += len(chunk)
+            tail = (tail + chunk)[-TAIL_BYTES:]
             yield chunk
     except GeneratorExit:
         outcome = "client_disconnect"
@@ -108,6 +137,19 @@ async def relay(
         outcome = "upstream_timeout"
         raise
     finally:
+        usage = usage_from_tail(tail) if outcome == "ok" else None
+        if usage:
+            record.prompt_tokens = usage.get("prompt_tokens")
+            record.completion_tokens = usage.get("completion_tokens")
         record.finish(response.status_code, outcome, started)
         await response.aclose()
         record.emit()
+        # Settling the reservation is skipped on a disconnect: the generator is
+        # being torn down and awaiting there is not reliable. The caller keeps
+        # the full reservation until it refills, which errs toward under-
+        # serving rather than over-spending the shared budget.
+        if on_finish is not None and outcome == "ok":
+            try:
+                await on_finish(record)
+            except Exception:  # pragma: no cover - accounting must not break a reply
+                pass

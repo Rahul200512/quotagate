@@ -136,10 +136,62 @@ Caveats, honestly:
 - **Token counts come from the provider's final frame**, so a stream the caller
   abandons records no token usage even though the tokens were generated.
 
+## v1 — a limit that survives a second copy (in progress)
+
+Two ceilings are enforced per call, and both are decided in one operation: the
+caller's own key, and the provider account everybody shares. Deciding them
+separately would mean charging a caller for a request that the account budget
+then refuses — and the refund path is exactly where a race lives.
+
+Tokens, not just requests, because Groq's free tier binds there first. The cost
+of a call is unknown until the reply exists, so the limiter reserves an
+estimate (prompt characters ÷ 4, plus the completion the caller allowed) and
+settles against the provider's real usage afterwards. An over-estimate is
+refunded, an under-estimate is charged, and refunds clamp at the ceiling so a
+run of cheap calls cannot mint budget.
+
+The per-process limiter is kept deliberately, as the measured baseline:
+
+| Copies of the service | Limit | Admitted | Over |
+|---|---|---|---|
+| 1, per-process buckets | 3 / min | 3 | 0% |
+| 2, per-process buckets | 3 / min | 6 | +100% |
+| 3, shared buckets in Redis | *pending* | *pending* | *pending* |
+
+Reproduce: `.venv/bin/python -m pytest tests/test_limits_live.py -q`, or against
+any deployment with `scripts/measure_limit.py --url ... --limit 10 --key qg_...`.
+The burst goes to `/debug/limit-check`, which takes the same limiter path as a
+real call and stops before the provider, so measuring enforcement doesn't spend
+the quota being enforced.
+
+Decisions worth naming:
+
+- **The whole check-and-deduct is one Lua script.** Read, decide, write in
+  Python would let two copies read the same remaining budget and both spend it,
+  which is the bug this repo exists to fix.
+- **Unreachable limiter means refuse, not allow.** Refusing costs one caller a
+  request; allowing spends a provider budget everyone shares. `QUOTAGATE_FAIL_OPEN`
+  exists but has to be asked for.
+- **`/healthz` says `shared` or `per-process`.** They are different promises, so
+  a missing environment variable should not quietly downgrade one into the other.
+- **Streaming requests get `stream_options.include_usage` added** if the caller
+  didn't set it, otherwise every streamed call would settle against an estimate.
+
+Caveats, honestly:
+
+- **The Redis path has not run against a real Redis yet.** The Lua script is
+  written and the two transports (Upstash HTTP, Redis protocol) are in place,
+  but every number above comes from the per-process baseline. Nothing claims
+  shared limits work until that row is filled in.
+- **An abandoned stream keeps its full reservation** until it refills. Settling
+  during teardown isn't reliable, so the error is toward under-serving rather
+  than over-spending.
+- **The estimate is crude** — four characters per token, no tokeniser. It is
+  reconciled immediately afterwards, so the error window is one call wide.
+
 ## What's next
 
-v1 puts the token bucket in Upstash Redis and makes the limit hold across
-copies of the service. See [ROADMAP.md](ROADMAP.md), including what I decided
+Verifying the Redis path, then deploying. See [ROADMAP.md](ROADMAP.md), including what I decided
 not to build and why.
 
 ## Run locally
@@ -161,6 +213,10 @@ quotagate/requestlog.py    one JSON record per request
 quotagate/page.py          front page; runs the streaming probe in the browser
 scripts/measure_stream.py  streamed-or-buffered verdict for any deployment
 scripts/new_key.py         mint a key, print its digest
+scripts/measure_limit.py   burst across copies; admitted vs the limit
+quotagate/limits.py        buckets, estimate, reconcile; per-process baseline
+quotagate/redis_buckets.py the same buckets in one Lua script, two transports
+docker-compose.yml         three copies + Redis, for the shared-limit test
 tests/fake_upstream.py     a provider that 429s, 500s, stalls and dies on demand
 tests/test_proxy.py        the proxy, over real sockets
 tests/test_stream.py       in-process: headers, validation, event shape
