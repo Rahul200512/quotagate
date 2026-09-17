@@ -121,18 +121,18 @@ provider owns.
 | A non-JSON provider error still returns an OpenAI-shaped error | `test_non_json_upstream_error_is_still_an_openai_shaped_error` |
 | A gateway with no keys refuses instead of standing open | `test_gateway_with_no_keys_refuses_instead_of_standing_open` |
 
-Reproduce: `.venv/bin/python -m pytest -q` — 18 tests, no network, no provider
+Reproduce: `.venv/bin/python -m pytest -q` — 38 tests, no network, no provider
 key. The provider in those tests is `tests/fake_upstream.py`, which rate-limits,
 500s, stalls and dies mid-stream on request.
 
 Caveats, honestly:
 
-- **There is no rate limiting yet.** That is the entire point of the project and
-  it lands in v1. Today a valid key can spend the whole Groq budget.
 - **Keys live in an environment variable**, hashed with SHA-256 and compared in
   constant time, but not yet in Neon and not yet revocable without a redeploy.
 - **The request log is a JSON line on stdout.** Vercel keeps an hour of runtime
   logs on the free plan, so usage history needs the database in v1.
+- **Rate limiting arrived with v1, below**, but only its per-process baseline is
+  measured so far.
 - **Token counts come from the provider's final frame**, so a stream the caller
   abandons records no token usage even though the tokens were generated.
 
