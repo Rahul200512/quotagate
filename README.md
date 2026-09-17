@@ -29,8 +29,23 @@ measured against the deployment rather than against my laptop.
 
 ## Try it
 
-Nothing to try yet — v0 is mid-flight. The first thing this repo answers is
-whether the platform I chose can stream at all:
+Not deployed yet. Locally:
+
+```
+.venv/bin/python scripts/new_key.py demo
+QUOTAGATE_KEYS="demo:<digest>" QUOTAGATE_UPSTREAM_KEY="$GROQ_API_KEY" \
+  .venv/bin/python -m uvicorn app:app
+```
+
+```
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H "authorization: Bearer qg_..." -H "content-type: application/json" \
+  -d '{"model":"llama-3.3-70b-versatile","stream":true,
+       "messages":[{"role":"user","content":"hello"}]}'
+```
+
+The first thing this repo answers, though, is whether the platform I chose can
+stream at all:
 
 ```
 python scripts/measure_stream.py http://127.0.0.1:8000
@@ -65,6 +80,7 @@ exits non-zero.
 | Where | Time to first event | Median arrival gap (asked for 200 ms) | Verdict |
 |---|---|---|---|
 | Local uvicorn | 67 ms | 201 ms | STREAMED |
+| Local, from the browser probe on the front page | 39 ms | 202 ms | STREAMED |
 | Vercel deployment | *pending* | *pending* | *pending* |
 
 Reproduce: `python scripts/measure_stream.py <url>`.
@@ -75,9 +91,50 @@ Caveats, honestly:
   hands back the whole body at once, so the incremental check runs against
   uvicorn on a real socket (`tests/test_stream_live.py`) and against the
   deployed URL. The in-process tests only check the anti-buffering headers.
-- v0 proves the *transport* streams. Cancelling the upstream model call when
-  the client disconnects is v1's job; today the test only proves the request
-  ends.
+- When a caller hangs up, the gateway closes the provider connection. What the
+  tests prove is that the request ends and the gateway stays healthy — not that
+  the provider stops generating. Whether Groq actually stops billing a
+  cancelled stream is measurable only against the real provider, and that check
+  belongs with v1's token accounting.
+
+## v0 — the proxy
+
+`POST /v1/chat/completions` and `GET /v1/models` speak OpenAI's contract, so any
+SDK reaches the gateway by changing `base_url` and nothing else. Two decisions
+are worth naming:
+
+**The upstream response is opened, its status read, and only then is a byte
+given to the caller.** Failing over to a second provider is only honest before
+the first token — after that the caller holds half an answer that a different
+model cannot continue. v2 plugs into that gap; v0 just makes sure the gap
+exists.
+
+**The stream is relayed as raw bytes.** Parsing and re-encoding every frame
+would add latency per token and give the gateway an opinion about a format the
+provider owns.
+
+| Behaviour | Where it's proven |
+|---|---|
+| Tokens reach the caller as the provider produces them | `test_streamed_tokens_arrive_as_they_are_produced` |
+| Hanging up closes the upstream connection | `test_client_disconnect_does_not_wedge_the_gateway` |
+| A provider 429 keeps its status and `retry-after` | `test_rate_limited_upstream_keeps_its_status_and_retry_after` |
+| A non-JSON provider error still returns an OpenAI-shaped error | `test_non_json_upstream_error_is_still_an_openai_shaped_error` |
+| A gateway with no keys refuses instead of standing open | `test_gateway_with_no_keys_refuses_instead_of_standing_open` |
+
+Reproduce: `.venv/bin/python -m pytest -q` — 18 tests, no network, no provider
+key. The provider in those tests is `tests/fake_upstream.py`, which rate-limits,
+500s, stalls and dies mid-stream on request.
+
+Caveats, honestly:
+
+- **There is no rate limiting yet.** That is the entire point of the project and
+  it lands in v1. Today a valid key can spend the whole Groq budget.
+- **Keys live in an environment variable**, hashed with SHA-256 and compared in
+  constant time, but not yet in Neon and not yet revocable without a redeploy.
+- **The request log is a JSON line on stdout.** Vercel keeps an hour of runtime
+  logs on the free plan, so usage history needs the database in v1.
+- **Token counts come from the provider's final frame**, so a stream the caller
+  abandons records no token usage even though the tokens were generated.
 
 ## What's next
 
@@ -97,8 +154,15 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 ```
 app.py                     Vercel entrypoint; exposes the ASGI app
-quotagate/api.py           routes: health, streaming probe
+quotagate/api.py           routes: front page, health, chat completions, probe
+quotagate/upstream.py      provider calls, status-before-first-byte, relay
+quotagate/keys.py          SHA-256 key digests, constant-time comparison
+quotagate/requestlog.py    one JSON record per request
+quotagate/page.py          front page; runs the streaming probe in the browser
 scripts/measure_stream.py  streamed-or-buffered verdict for any deployment
+scripts/new_key.py         mint a key, print its digest
+tests/fake_upstream.py     a provider that 429s, 500s, stalls and dies on demand
+tests/test_proxy.py        the proxy, over real sockets
 tests/test_stream.py       in-process: headers, validation, event shape
 tests/test_stream_live.py  real socket: arrival gaps, client disconnect
 ```

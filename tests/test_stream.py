@@ -60,3 +60,13 @@ async def test_stream_rejects_absurd_parameters(client: httpx.AsyncClient) -> No
         too_slow = await client.get("/debug/stream?chunks=5&gap_ms=600000")
     assert too_many.status_code == 422
     assert too_slow.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_front_page_renders_without_a_key(client: httpx.AsyncClient) -> None:
+    """A visitor with no key should still land on something that works."""
+    async with client:
+        response = await client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "/debug/stream" in response.text

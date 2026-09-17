@@ -9,9 +9,12 @@ the README come from the deployed service, not from localhost.
 - [x] `scripts/measure_stream.py`: streamed-or-buffered verdict against any URL
 - [x] Tests that a real socket, not an in-process transport, has to satisfy
 - [ ] Deployed to Vercel, probe re-run against the deployment
-- [ ] `POST /v1/chat/completions` proxying Groq, streaming passed through
-- [ ] API keys hashed in Neon, request log written off the hot path
-- [ ] Front page with a public demo key
+- [x] `POST /v1/chat/completions` and `/v1/models`, streaming passed through
+- [x] API keys as SHA-256 digests, compared in constant time
+- [x] One JSON request record per call, written after the last byte
+- [x] Front page that runs the probe in the visitor's browser
+- [ ] Keys and request log in Neon (moves with v1's quota counters)
+- [ ] Public demo key with a small quota (needs v1's limiter to be safe)
 
 **Open question this milestone answers:** does a Python function on Vercel
 deliver chunks as they are produced? Vercel's changelog says streaming is on by
