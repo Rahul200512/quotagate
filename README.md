@@ -3,7 +3,9 @@
 An OpenAI-compatible gateway that puts shared rate limits, failover and usage
 accounting in front of a model provider.
 
-Live: *not deployed yet — v0 lands this week.*
+[![CI](https://github.com/Rahul200512/quotagate/actions/workflows/ci.yml/badge.svg)](https://github.com/Rahul200512/quotagate/actions/workflows/ci.yml)
+
+Live: *not deployed yet — the deployment lands as soon as the Vercel project exists.*
 
 ## Why
 
