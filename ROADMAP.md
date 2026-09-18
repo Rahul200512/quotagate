@@ -30,8 +30,9 @@ the gateway moves to Render and the Vercel project keeps only the front page.
 - [x] `/debug/limit-check` so enforcement can be measured without spending quota
 - [x] Fail-closed when the limiter is unreachable; `/healthz` reports which
       promise is in force
-- [ ] The Lua script run against a real Redis, and the shared-limit row filled in
-- [ ] Upstash account, then the same measurement against the deployment
+- [x] The Lua script run against real Upstash; shared-limit row filled in
+      (2 copies, limit 10, 40 requests: 20 admitted per-process, 10 shared)
+- [ ] The same measurement against the deployment
 - Token bucket in Upstash Redis, evaluated in one atomic script
 - Per-key requests/minute and tokens/minute; reserve an estimate, reconcile
   against real usage from the response
@@ -54,7 +55,8 @@ behaviour with Redis switched off.
 - [x] `x-quotagate-provider` and `x-quotagate-attempts` on every response
 - [x] A fake upstream that stalls, 500s, 429s, 400s and dies mid-stream
 - [ ] Breaker and budget state in Redis, shared across copies
-- [ ] A real second provider (OpenRouter) rather than a second fake
+- [x] A real second provider: Groq unreachable, OpenRouter answered
+- [ ] Per-provider model mapping, so failover survives a provider-specific id
 
 **Measured:** success rate and time-to-first-token under each injected fault,
 with and without each mechanism.

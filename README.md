@@ -42,7 +42,7 @@ QUOTAGATE_KEYS="demo:<digest>" QUOTAGATE_UPSTREAM_KEY="$GROQ_API_KEY" \
 ```
 curl -N http://127.0.0.1:8000/v1/chat/completions \
   -H "authorization: Bearer qg_..." -H "content-type: application/json" \
-  -d '{"model":"llama-3.3-70b-versatile","stream":true,
+  -d '{"model":"openai/gpt-oss-20b","stream":true,
        "messages":[{"role":"user","content":"hello"}]}'
 ```
 
@@ -154,14 +154,26 @@ run of cheap calls cannot mint budget.
 
 The per-process limiter is kept deliberately, as the measured baseline:
 
-| Copies of the service | Limit | Admitted | Over |
-|---|---|---|---|
-| 1, per-process buckets | 3 / min | 3 | 0% |
-| 2, per-process buckets | 3 / min | 6 | +100% |
-| 3, shared buckets in Redis | *pending* | *pending* | *pending* |
+40 requests, split evenly across two copies of the service, limit 10/minute:
 
-Reproduce: `.venv/bin/python -m pytest tests/test_limits_live.py -q`, or against
-any deployment with `scripts/measure_limit.py --url ... --limit 10 --key qg_...`.
+| Buckets | Copies | Admitted | Over the limit |
+|---|---|---|---|
+| per-process | 2 | 20 (10 + 10) | **+100%** |
+| shared, Upstash Redis | 2 | 10 (5 + 5) | **0%** |
+
+That is the whole project in one table. The same code, the same burst, the same
+limit; the only difference is where the bucket lives.
+
+Reproduce: start two copies, then
+
+```
+python scripts/measure_limit.py --key qg_... --limit 10 --requests 40 \
+  --url http://127.0.0.1:8201 --url http://127.0.0.1:8202
+```
+
+with `QUOTAGATE_REDIS_REST_URL`/`_TOKEN` set for the shared row and unset for the
+per-process one. The Lua script itself is exercised against real Upstash by
+`tests/test_live_services.py`.
 The burst goes to `/debug/limit-check`, which takes the same limiter path as a
 real call and stops before the provider, so measuring enforcement doesn't spend
 the quota being enforced.
@@ -181,10 +193,11 @@ Decisions worth naming:
 
 Caveats, honestly:
 
-- **The Redis path has not run against a real Redis yet.** The Lua script is
-  written and the two transports (Upstash HTTP, Redis protocol) are in place,
-  but every number above comes from the per-process baseline. Nothing claims
-  shared limits work until that row is filled in.
+- **Each limiter call costs a network round trip.** From my laptop to Upstash's
+  us-east-1 region that is ~131 ms, which would dwarf the gateway itself. The
+  deployment runs in the same region as the database, where it should be a
+  millisecond or two — that number gets measured against the deployment, not
+  claimed from here.
 - **An abandoned stream keeps its full reservation** until it refills. Settling
   during teardown isn't reliable, so the error is toward under-serving rather
   than over-spending.
@@ -234,6 +247,7 @@ is visible from outside instead of only in logs.
 | Primary dies mid-stream | Stream ends broken, no retry, tokens already sent are kept |
 | Primary fails 6 times | Circuit opens; later calls skip it entirely |
 | Everything down, 12 calls | Retries stop when the budget runs out |
+| **Groq unreachable, real call** | **OpenRouter answered: `groq:cannot reach groq,openrouter:200`** |
 
 Reproduce: `.venv/bin/python -m pytest tests/test_failover.py tests/test_resilience.py -q`.
 The providers are two copies of `tests/fake_upstream.py`; prefixing a model with
@@ -245,9 +259,10 @@ Caveats, honestly:
   defensible — each copy learns from what it saw. For the budget it is not: N
   copies allow N times the retries. Both move into Redis once v1's shared
   buckets are verified against a real Redis.
-- **There is still only one provider configured.** The second is a fake until
-  an OpenRouter key exists, so failover is proven against injected faults, not
-  against a real outage.
+- **Failover needs a model both providers serve.** `openai/gpt-oss-20b` exists
+  on Groq and on OpenRouter, which is why the pair works; a Groq-only model id
+  would fail over into a 404. Per-provider model mapping is not built yet, and
+  the roadmap says so.
 - **No hedging.** Sending the same request to two providers and taking the
   faster reply would cut tail latency and double the spend; on a free tier that
   trade is not available.
