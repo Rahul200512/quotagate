@@ -29,6 +29,8 @@ class RequestRecord:
     # "upstream_error", "client_disconnect", "gateway_error".
     outcome: str = "ok"
     upstream_ms: float = 0.0
+    # How long consulting the shared limiter took, measured where it runs.
+    limiter_ms: float = 0.0
     first_byte_ms: float | None = None
     chunks: int = 0
     bytes_out: int = 0

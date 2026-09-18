@@ -5,7 +5,8 @@ accounting in front of a model provider.
 
 [![CI](https://github.com/Rahul200512/quotagate/actions/workflows/ci.yml/badge.svg)](https://github.com/Rahul200512/quotagate/actions/workflows/ci.yml)
 
-Live: *not deployed yet — the deployment lands as soon as the Vercel project exists.*
+Live: **https://quotagate.vercel.app** — the front page runs the streaming probe
+and a real completion in your browser, against a public demo key.
 
 ## Why
 
@@ -31,7 +32,19 @@ measured against the deployment rather than against my laptop.
 
 ## Try it
 
-Not deployed yet. Locally:
+```
+curl -N https://quotagate.vercel.app/v1/chat/completions \
+  -H "authorization: Bearer qg_demo_jofwzC2Z1Babr3KVM7DRh68K" \
+  -H "content-type: application/json" \
+  -d '{"model":"openai/gpt-oss-20b","stream":true,
+       "messages":[{"role":"user","content":"hello"}]}'
+```
+
+That key is public on purpose. It is capped at 10 requests and 6,000 tokens a
+minute, shared by everyone who reads this, so leaning on it demonstrates the
+limiter rather than costing me anything.
+
+Locally:
 
 ```
 .venv/bin/python scripts/new_key.py demo
@@ -83,7 +96,13 @@ exits non-zero.
 |---|---|---|---|
 | Local uvicorn | 67 ms | 201 ms | STREAMED |
 | Local, from the browser probe on the front page | 39 ms | 202 ms | STREAMED |
-| Vercel deployment | *pending* | *pending* | *pending* |
+| **Vercel deployment** | **445 ms** | **201 ms** | **STREAMED** |
+
+The deployment answers the question v0 was built to ask: a Python function on
+Vercel hands chunks over as they are produced, through their proxy, to a client
+on the other side of the country. The 445 ms to the first event is my laptop's
+distance to the region plus a cold start; the 201 ms median is the cadence the
+server was asked for, arriving intact.
 
 Reproduce: `python scripts/measure_stream.py <url>`.
 
@@ -193,11 +212,21 @@ Decisions worth naming:
 
 Caveats, honestly:
 
-- **Each limiter call costs a network round trip.** From my laptop to Upstash's
-  us-east-1 region that is ~131 ms, which would dwarf the gateway itself. The
-  deployment runs in the same region as the database, where it should be a
-  millisecond or two — that number gets measured against the deployment, not
-  claimed from here.
+**What the limiter costs, measured where it runs.** Each call is one round trip
+to Upstash, so the number depends entirely on who is asking:
+
+| Asking from | Limiter round trip |
+|---|---|
+| my laptop | 131 ms |
+| the deployment, first call on a cold instance | 43 ms |
+| the deployment, warm | **4.3 ms** |
+
+The gateway reports its own figure as `x-quotagate-limiter-ms` on every
+response, because a number measured from my kitchen table is a measurement of
+my broadband, not of the gateway.
+
+In production, with the limit at 10 a minute, a burst of 30 requests was
+admitted 9 times — the tenth had gone to a completion a moment earlier.
 - **An abandoned stream keeps its full reservation** until it refills. Settling
   during teardown isn't reliable, so the error is toward under-serving rather
   than over-spending.

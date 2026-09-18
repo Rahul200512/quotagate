@@ -7,7 +7,12 @@ deployment streams, measured on their connection rather than claimed in prose.
 
 from __future__ import annotations
 
-INDEX_HTML = """<!doctype html>
+def render(demo_key: str) -> str:
+    """The page, with the public demo key handed to its script."""
+    return INDEX_HTML.replace("__DEMO_KEY__", demo_key)
+
+
+INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>quotagate</title>
@@ -31,6 +36,8 @@ INDEX_HTML = """<!doctype html>
   pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
         padding: 12px 14px; overflow-x: auto; font-size: 13px; }
   .probe { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  /* Model output is prose, not code: it has to wrap rather than scroll. */
+  #answer { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 12px; }
   button { font: inherit; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--line);
            background: var(--accent); color: #fff; cursor: pointer; }
   button[disabled] { opacity: .6; cursor: default; }
@@ -53,11 +60,22 @@ INDEX_HTML = """<!doctype html>
     <div id="out"></div>
   </div>
 
+  <h2>Ask the model through it</h2>
+  <div class="probe">
+    <p style="margin-top:0">This runs a real completion through the gateway: shared rate
+    limit, provider failover, usage accounting. The demo key is public and deliberately
+    small — 10 requests and 6,000 tokens a minute, shared by everyone on this page — so
+    if you hold the button down you will meet the limiter, which is the point.</p>
+    <button id="ask">Ask: “what is a rate limiter?”</button>
+    <pre id="answer" hidden></pre>
+    <div id="meta"></div>
+  </div>
+
   <h2>Point any OpenAI client at it</h2>
-  <pre>curl -N $BASE/v1/chat/completions \\
-  -H "authorization: Bearer $KEY" \\
+  <pre id="snippet">curl -N https://quotagate.vercel.app/v1/chat/completions \\
+  -H "authorization: Bearer DEMO_KEY" \\
   -H "content-type: application/json" \\
-  -d '{"model":"llama-3.3-70b-versatile","stream":true,
+  -d '{"model":"openai/gpt-oss-20b","stream":true,
        "messages":[{"role":"user","content":"hello"}]}'</pre>
 
   <footer>
@@ -66,6 +84,96 @@ INDEX_HTML = """<!doctype html>
   </footer>
 </main>
 <script>
+  const DEMO_KEY = "__DEMO_KEY__";
+  if (!DEMO_KEY) {
+    document.getElementById("ask").disabled = true;
+    document.getElementById("meta").textContent =
+      "No demo key is configured on this deployment.";
+  }
+  document.getElementById("snippet").textContent =
+    document.getElementById("snippet").textContent.replace("DEMO_KEY", DEMO_KEY);
+
+  const askButton = document.getElementById("ask");
+  const answer = document.getElementById("answer");
+  const meta = document.getElementById("meta");
+
+  askButton.addEventListener("click", async () => {
+    askButton.disabled = true;
+    answer.hidden = false;
+    answer.textContent = "";
+    meta.innerHTML = "";
+    const started = performance.now();
+    let firstToken = null;
+
+    const response = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer " + DEMO_KEY },
+      body: JSON.stringify({
+        model: "openai/gpt-oss-20b",
+        stream: true,
+        max_tokens: 400,
+        // gpt-oss thinks before it answers, and those reasoning tokens come
+        // out of the same allowance. At 120 the whole budget went to thinking
+        // and the demo rendered nothing.
+        reasoning_effort: "low",
+        messages: [{ role: "user", content: "In two sentences, what is a rate limiter?" }],
+      }),
+    });
+
+    const info = {
+      provider: response.headers.get("x-quotagate-provider"),
+      attempts: response.headers.get("x-quotagate-attempts"),
+      limiter: response.headers.get("x-quotagate-limiter-ms"),
+      remaining: response.headers.get("ratelimit-remaining"),
+      tokens: response.headers.get("ratelimit-tokens-remaining"),
+    };
+
+    if (response.status === 429) {
+      const wait = response.headers.get("retry-after");
+      answer.textContent =
+        "Rate limited by " + (response.headers.get("ratelimit-bound-by") || "the gateway") +
+        ". Try again in " + wait + "s — this is the limiter doing its job.";
+      askButton.disabled = false;
+      return;
+    }
+    if (!response.ok) {
+      answer.textContent = "The gateway returned " + response.status + ".";
+      askButton.disabled = false;
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      const frames = buffered.split("\n\n");
+      buffered = frames.pop();
+      for (const frame of frames) {
+        if (!frame.startsWith("data: ") || frame.includes("[DONE]")) continue;
+        try {
+          const delta = JSON.parse(frame.slice(6)).choices?.[0]?.delta || {};
+          const text = delta.content || "";
+          if (text) {
+            if (firstToken === null) firstToken = performance.now() - started;
+            answer.textContent += text;
+          }
+        } catch (err) { /* a frame split across reads */ }
+      }
+    }
+
+    meta.innerHTML =
+      "<table>" +
+      "<tr><th>answered by</th><td>" + info.provider + " (" + info.attempts + ")</td></tr>" +
+      "<tr><th>first token</th><td>" + (firstToken ? firstToken.toFixed(0) : "—") + " ms</td></tr>" +
+      "<tr><th>limiter cost</th><td>" + info.limiter + " ms</td></tr>" +
+      "<tr><th>your remaining budget</th><td>" + info.remaining + " requests, " +
+      info.tokens + " tokens this minute</td></tr></table>";
+    askButton.disabled = false;
+  });
+
   const button = document.getElementById("run");
   const out = document.getElementById("out");
   button.addEventListener("click", async () => {
@@ -80,7 +188,7 @@ INDEX_HTML = """<!doctype html>
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        for (const line of decoder.decode(value).split("\\n")) {
+        for (const line of decoder.decode(value).split("\n")) {
           if (line.startsWith("data: ") && !line.includes("[DONE]")) {
             arrivals.push(performance.now() - started);
           }

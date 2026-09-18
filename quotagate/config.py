@@ -26,6 +26,7 @@ class Settings:
     connect_timeout: float
     read_timeout: float
     keys_raw: str
+    demo_key: str
 
     @property
     def has_upstream_key(self) -> bool:
@@ -42,6 +43,10 @@ def load() -> Settings:
         connect_timeout=_float_env("QUOTAGATE_CONNECT_TIMEOUT", 5.0),
         read_timeout=_float_env("QUOTAGATE_READ_TIMEOUT", 45.0),
         keys_raw=os.environ.get("QUOTAGATE_KEYS", ""),
+        # The demo key is published on the front page on purpose: it is the
+        # thing a visitor tries the gateway with, and its small quota is the
+        # feature being demonstrated. It is a key, not a secret.
+        demo_key=os.environ.get("QUOTAGATE_DEMO_KEY", ""),
     )
 
 

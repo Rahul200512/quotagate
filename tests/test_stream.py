@@ -70,3 +70,14 @@ async def test_front_page_renders_without_a_key(client: httpx.AsyncClient) -> No
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert "/debug/stream" in response.text
+
+
+@pytest.mark.asyncio
+async def test_the_front_page_says_so_when_no_demo_key_is_configured(
+    client: httpx.AsyncClient,
+) -> None:
+    """Better an honest empty state than a button that 401s."""
+    async with client:
+        response = await client.get("/")
+    assert "__DEMO_KEY__" not in response.text
+    assert 'const DEMO_KEY = ""' in response.text

@@ -19,7 +19,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from quotagate import __version__, upstream
-from quotagate.page import INDEX_HTML
+from quotagate.page import render as render_page
 from quotagate.cache import Cache, Entry, InMemoryCache, is_cacheable, key_for
 from quotagate.config import cache as cache_settings
 from quotagate.config import limits as limit_settings
@@ -215,7 +215,7 @@ def authenticate(request: Request) -> ApiKey | JSONResponse:
 
 @app.get("/", include_in_schema=False)
 async def index() -> HTMLResponse:
-    return HTMLResponse(INDEX_HTML)
+    return HTMLResponse(render_page(settings.demo_key))
 
 
 @app.get("/healthz")
@@ -273,6 +273,7 @@ async def chat_completions(request: Request) -> Response:
     scopes = scopes_for(key)
     buckets: Buckets = request.app.state.buckets
     reserved = estimate_cost(payload)
+    limiter_started = time.perf_counter()
     try:
         decision = await buckets.take(scopes, reserved)
     except Exception as exc:  # Redis unreachable, timing out, or refusing
@@ -286,6 +287,8 @@ async def chat_completions(request: Request) -> Response:
                 {"retry-after": "5"},
             )
         decision = None
+
+    record.limiter_ms = round((time.perf_counter() - limiter_started) * 1000, 1)
 
     if decision is not None and not decision.allowed:
         return error(
@@ -366,6 +369,9 @@ async def chat_completions(request: Request) -> Response:
     limit_headers["x-quotagate-provider"] = routed.provider.name
     limit_headers["x-quotagate-attempts"] = record.attempts
     limit_headers["x-quotagate-cache"] = "miss" if cacheable else "skip"
+    # Measured inside the deployment: from a laptop this number would be the
+    # distance to Vercel, not the cost of consulting Redis.
+    limit_headers["x-quotagate-limiter-ms"] = str(record.limiter_ms)
 
     if wants_stream:
         return StreamingResponse(
@@ -429,12 +435,15 @@ async def limit_check(request: Request, cost: int = Query(1, ge=1, le=100_000)) 
         return key
 
     scopes = scopes_for(key)
+    started = time.perf_counter()
     try:
         decision = await request.app.state.buckets.take(scopes, cost)
     except Exception as exc:
         return error(503, "limiter_unavailable", f"{type(exc).__name__}", {"retry-after": "5"})
 
     status = 200 if decision.allowed else 429
+    headers = decision.headers(KEY_LIMIT)
+    headers["x-quotagate-limiter-ms"] = str(round((time.perf_counter() - started) * 1000, 1))
     return JSONResponse(
         {
             "allowed": decision.allowed,
@@ -443,7 +452,7 @@ async def limit_check(request: Request, cost: int = Query(1, ge=1, le=100_000)) 
             "shared": limit_settings.shared,
         },
         status_code=status,
-        headers=decision.headers(KEY_LIMIT),
+        headers=headers,
     )
 
 

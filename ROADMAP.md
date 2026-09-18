@@ -8,13 +8,13 @@ the README come from the deployed service, not from localhost.
 - [x] FastAPI app, health check, SSE probe endpoint with a known cadence
 - [x] `scripts/measure_stream.py`: streamed-or-buffered verdict against any URL
 - [x] Tests that a real socket, not an in-process transport, has to satisfy
-- [ ] Deployed to Vercel, probe re-run against the deployment
+- [x] Deployed to Vercel, probe re-run against the deployment: STREAMED
 - [x] `POST /v1/chat/completions` and `/v1/models`, streaming passed through
 - [x] API keys as SHA-256 digests, compared in constant time
 - [x] One JSON request record per call, written after the last byte
 - [x] Front page that runs the probe in the visitor's browser
 - [ ] Keys and request log in Neon (moves with v1's quota counters)
-- [ ] Public demo key with a small quota (needs v1's limiter to be safe)
+- [x] Public demo key with a small quota, and a front page that spends it
 
 **Open question this milestone answers:** does a Python function on Vercel
 deliver chunks as they are produced? Vercel's changelog says streaming is on by
@@ -32,7 +32,7 @@ the gateway moves to Render and the Vercel project keeps only the front page.
       promise is in force
 - [x] The Lua script run against real Upstash; shared-limit row filled in
       (2 copies, limit 10, 40 requests: 20 admitted per-process, 10 shared)
-- [ ] The same measurement against the deployment
+- [x] The same measurement against the deployment (limiter costs 4.3 ms warm)
 - Token bucket in Upstash Redis, evaluated in one atomic script
 - Per-key requests/minute and tokens/minute; reserve an estimate, reconcile
   against real usage from the response
