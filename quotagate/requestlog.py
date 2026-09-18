@@ -32,6 +32,9 @@ class RequestRecord:
     first_byte_ms: float | None = None
     chunks: int = 0
     bytes_out: int = 0
+    # Which providers were asked and what each said, e.g.
+    # "groq:500,openrouter:200" — the first thing worth seeing after a failover.
+    attempts: str = ""
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     started_at: float = field(default_factory=time.time)

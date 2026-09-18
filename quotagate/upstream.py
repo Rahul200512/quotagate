@@ -40,9 +40,9 @@ class UpstreamUnavailable(Exception):
         self.status = status
 
 
-def build_client(settings: Settings) -> httpx.AsyncClient:
+def build_client(settings: Settings, base_url: str | None = None) -> httpx.AsyncClient:
     return httpx.AsyncClient(
-        base_url=settings.upstream_base_url,
+        base_url=base_url or settings.upstream_base_url,
         timeout=httpx.Timeout(
             connect=settings.connect_timeout,
             read=settings.read_timeout,
@@ -56,10 +56,11 @@ def build_client(settings: Settings) -> httpx.AsyncClient:
     )
 
 
-def _headers(settings: Settings) -> dict[str, str]:
+def _headers(settings: Settings, api_key: str | None = None) -> dict[str, str]:
     headers = {"content-type": "application/json"}
-    if settings.upstream_api_key:
-        headers["authorization"] = f"Bearer {settings.upstream_api_key}"
+    key = api_key if api_key is not None else settings.upstream_api_key
+    if key:
+        headers["authorization"] = f"Bearer {key}"
     return headers
 
 
@@ -67,23 +68,26 @@ async def open_stream(
     client: httpx.AsyncClient,
     settings: Settings,
     payload: dict,
+    api_key: str | None = None,
+    provider_name: str | None = None,
 ) -> httpx.Response:
     """Send the request and return the open response, status already known.
 
     Raises UpstreamUnavailable when the provider never answered. The caller
     owns the returned response and must close it.
     """
+    name = provider_name or settings.upstream_name
     request = client.build_request(
-        "POST", "/chat/completions", json=payload, headers=_headers(settings)
+        "POST", "/chat/completions", json=payload, headers=_headers(settings, api_key)
     )
     try:
         return await client.send(request, stream=True)
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-        raise UpstreamUnavailable(f"cannot reach {settings.upstream_name}", 502) from exc
+        raise UpstreamUnavailable(f"cannot reach {name}", 502) from exc
     except httpx.ReadTimeout as exc:
-        raise UpstreamUnavailable(f"{settings.upstream_name} timed out", 504) from exc
+        raise UpstreamUnavailable(f"{name} timed out", 504) from exc
     except httpx.HTTPError as exc:  # pragma: no cover - defensive
-        raise UpstreamUnavailable(f"{settings.upstream_name} failed: {exc!r}", 502) from exc
+        raise UpstreamUnavailable(f"{name} failed: {exc!r}", 502) from exc
 
 
 def usage_from_tail(tail: bytes) -> dict | None:

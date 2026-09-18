@@ -189,9 +189,70 @@ Caveats, honestly:
 - **The estimate is crude** — four characters per token, no tokeniser. It is
   reconciled immediately afterwards, so the error window is one call wide.
 
+## v2 — failing over without lying (in progress)
+
+Providers are tried in order, and the decision to move on happens **before the
+first byte reaches the caller**. After that it is too late: the caller holds
+half an answer, and a second model cannot continue a sentence it did not start.
+A stream that dies midway ends as a broken stream, without `[DONE]`, rather
+than as a seam between two models pretending to be one.
+
+What is worth moving on for, and what is not:
+
+| Provider says | Gateway does | Why |
+|---|---|---|
+| unreachable / timed out | try the next provider | nothing was sent; nothing is lost |
+| 5xx | try the next provider | the provider says it is broken |
+| 429 | try the next provider | another provider may still have budget |
+| 4xx | return it unchanged | the request is wrong; a second provider would reject it identically, and this is not the provider's fault |
+| died mid-stream | end the stream | see above |
+
+Two protections sit on top, and they protect the *provider* as much as the
+caller — a gateway that retries everything doubles a provider's traffic exactly
+when it is failing:
+
+- **A circuit breaker per provider.** Five consecutive failures and it stops
+  being asked for a cooldown; then exactly one call is let through to find out
+  whether it recovered. Consecutive failures, not a failure rate, because a 10%
+  error rate is a bad day rather than an outage.
+- **A retry budget for the deployment.** Retries are capped as a fraction of
+  traffic (one per five requests by default), not counted per request. With
+  everything failing, 20 calls buy 8 retries, not 20.
+
+Every response carries `x-quotagate-provider` and `x-quotagate-attempts`
+(`alpha:500,beta:200`, or `alpha:skipped(circuit_open),beta:200`), so a failover
+is visible from outside instead of only in logs.
+
+| Injected fault | Result |
+|---|---|
+| Primary returns 500 | Second provider answers; `alpha:500,beta:200` |
+| Primary rate limits (429) | Second provider answers |
+| Primary unreachable | Second provider answers |
+| Caller sends a bad request (400) | Returned as-is, no second attempt |
+| Primary dies mid-stream | Stream ends broken, no retry, tokens already sent are kept |
+| Primary fails 6 times | Circuit opens; later calls skip it entirely |
+| Everything down, 12 calls | Retries stop when the budget runs out |
+
+Reproduce: `.venv/bin/python -m pytest tests/test_failover.py tests/test_resilience.py -q`.
+The providers are two copies of `tests/fake_upstream.py`; prefixing a model with
+a provider name (`alpha:fake-500`) makes only that one misbehave.
+
+Caveats, honestly:
+
+- **The breaker and the budget are per-process.** For a breaker that is
+  defensible — each copy learns from what it saw. For the budget it is not: N
+  copies allow N times the retries. Both move into Redis once v1's shared
+  buckets are verified against a real Redis.
+- **There is still only one provider configured.** The second is a fake until
+  an OpenRouter key exists, so failover is proven against injected faults, not
+  against a real outage.
+- **No hedging.** Sending the same request to two providers and taking the
+  faster reply would cut tail latency and double the spend; on a free tier that
+  trade is not available.
+
 ## What's next
 
-Verifying the Redis path, then deploying. See [ROADMAP.md](ROADMAP.md), including what I decided
+Verifying the Redis path against a real Redis, then deploying. See [ROADMAP.md](ROADMAP.md), including what I decided
 not to build and why.
 
 ## Run locally
@@ -216,9 +277,12 @@ scripts/new_key.py         mint a key, print its digest
 scripts/measure_limit.py   burst across copies; admitted vs the limit
 quotagate/limits.py        buckets, estimate, reconcile; per-process baseline
 quotagate/redis_buckets.py the same buckets in one Lua script, two transports
+quotagate/providers.py     provider order, and which failures are worth moving for
+quotagate/resilience.py    circuit breaker, retry budget
 docker-compose.yml         three copies + Redis, for the shared-limit test
 tests/fake_upstream.py     a provider that 429s, 500s, stalls and dies on demand
 tests/test_proxy.py        the proxy, over real sockets
+tests/test_failover.py     two providers, injected faults, breaker, budget
 tests/test_stream.py       in-process: headers, validation, event shape
 tests/test_stream_live.py  real socket: arrival gaps, client disconnect
 ```

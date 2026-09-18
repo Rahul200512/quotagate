@@ -12,6 +12,7 @@ import json
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 import httpx
 from fastapi import FastAPI, Query, Request
@@ -20,9 +21,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from quotagate import __version__, upstream
 from quotagate.page import INDEX_HTML
 from quotagate.config import limits as limit_settings
+from quotagate.config import providers as provider_specs
+from quotagate.config import resilience
 from quotagate.config import settings
 from quotagate.keys import ApiKey, bearer_token, find, parse_keys
 from quotagate.limits import Buckets, InMemoryBuckets, Limit, Scope, estimate_cost
+from quotagate.providers import Attempt, Provider, should_try_another
+from quotagate.resilience import CircuitBreaker, RetryBudget
 from quotagate.redis_buckets import RedisBuckets, RestTransport, TcpTransport
 from quotagate.requestlog import RequestRecord
 from quotagate.upstream import UpstreamUnavailable
@@ -68,14 +73,114 @@ def scopes_for(key: ApiKey) -> list[Scope]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    app.state.upstream = upstream.build_client(settings)
+    app.state.providers = [
+        Provider(
+            name=spec.name,
+            base_url=spec.base_url,
+            api_key=spec.api_key,
+            client=upstream.build_client(settings, spec.base_url),
+            breaker=CircuitBreaker(
+                threshold=resilience.breaker_threshold, cooldown=resilience.breaker_cooldown
+            ),
+        )
+        for spec in provider_specs
+    ]
+    # Kept for /v1/models, which asks the first provider only.
+    app.state.upstream = app.state.providers[0].client
     app.state.keys = parse_keys(settings.keys_raw)
     app.state.buckets = build_buckets()
+    app.state.retry_budget = RetryBudget(
+        ratio=resilience.retry_ratio, burst=resilience.retry_burst, tokens=resilience.retry_burst
+    )
     try:
         yield
     finally:
-        await app.state.upstream.aclose()
+        for provider in app.state.providers:
+            await provider.client.aclose()
         await app.state.buckets.aclose()
+
+
+@dataclass
+class Routed:
+    """Where a request ended up, and everything tried on the way."""
+
+    attempts: list[Attempt]
+    response: httpx.Response | None = None
+    provider: Provider | None = None
+    failure: Response | None = None
+
+
+def _error_from_upstream(status: int, body: bytes, provider: str) -> Response:
+    headers = {"x-quotagate-provider": provider}
+    try:
+        return JSONResponse(json.loads(body), status_code=status, headers=headers)
+    except json.JSONDecodeError:
+        return error(status, "upstream_error", body.decode(errors="replace")[:500], headers)
+
+
+async def route(app: FastAPI, payload: dict) -> Routed:
+    """Try providers in order, stopping the moment one answers.
+
+    Every decision here happens before a byte reaches the caller. That is the
+    only point where moving to another provider is honest: afterwards the
+    caller holds half an answer that a different model cannot continue.
+    """
+    budget: RetryBudget = app.state.retry_budget
+    budget.record_request()
+    attempts: list[Attempt] = []
+    last_failure: Response | None = None
+
+    for index, provider in enumerate(app.state.providers):
+        if index and not budget.try_spend():
+            # A broad outage should degrade into fast failures, not a stampede
+            # of retries arriving at whichever provider is still standing.
+            attempts.append(Attempt(provider.name, skipped=True, error="no_retry_budget"))
+            break
+        if not provider.breaker.allows():
+            attempts.append(Attempt(provider.name, skipped=True, error="circuit_open"))
+            continue
+
+        try:
+            response = await upstream.open_stream(
+                provider.client, settings, payload, provider.api_key, provider.name
+            )
+        except UpstreamUnavailable as exc:
+            provider.breaker.record_failure()
+            attempts.append(Attempt(provider.name, error=exc.reason))
+            last_failure = error(exc.status, "upstream_unavailable", exc.reason)
+            continue
+
+        attempts.append(Attempt(provider.name, status=response.status_code))
+
+        if response.status_code < 400:
+            provider.breaker.record_success()
+            return Routed(attempts=attempts, response=response, provider=provider)
+
+        body = await response.aread()
+        await response.aclose()
+
+        if not should_try_another(response.status_code):
+            # The caller's request is wrong; another provider would reject it
+            # identically, and this is not the provider's fault.
+            return Routed(
+                attempts=attempts,
+                failure=_error_from_upstream(response.status_code, body, provider.name),
+            )
+
+        provider.breaker.record_failure()
+        headers = {}
+        if "retry-after" in response.headers:
+            headers["retry-after"] = response.headers["retry-after"]
+        failure = _error_from_upstream(response.status_code, body, provider.name)
+        for name, value in headers.items():
+            failure.headers[name] = value
+        last_failure = failure
+
+    return Routed(
+        attempts=attempts,
+        failure=last_failure
+        or error(503, "no_provider_available", "every provider is failing or circuit-broken"),
+    )
 
 
 app = FastAPI(title="quotagate", version=__version__, docs_url="/docs", lifespan=lifespan)
@@ -119,6 +224,10 @@ async def healthz() -> JSONResponse:
             "upstream": settings.upstream_name,
             "upstream_key_configured": settings.has_upstream_key,
             "keys_configured": len(app.state.keys) if hasattr(app.state, "keys") else 0,
+            "providers": [
+                {"name": p.name, "circuit": p.breaker.state().value}
+                for p in (app.state.providers if hasattr(app.state, "providers") else [])
+            ],
             "limits": {
                 # "per-process" is a weaker promise than "shared", so it is
                 # reported rather than hidden behind the same word.
@@ -196,34 +305,22 @@ async def chat_completions(request: Request) -> Response:
     )
     started = time.perf_counter()
 
-    try:
-        response = await upstream.open_stream(request.app.state.upstream, settings, payload)
-    except UpstreamUnavailable as exc:
-        record.finish(exc.status, "upstream_unreachable", started)
-        record.emit()
-        return error(exc.status, "upstream_unavailable", exc.reason)
+    routed = await route(request.app, payload)
+    record.attempts = ",".join(attempt.as_text() for attempt in routed.attempts)
 
-    if response.status_code >= 400:
-        # Nothing has been sent to the caller yet, which is the only point
-        # where switching providers (v2) would still be honest.
-        body = await response.aread()
-        await response.aclose()
-        record.finish(response.status_code, "upstream_error", started)
+    if routed.response is None:
+        record.finish(routed.failure.status_code, "upstream_error", started)
         record.emit()
-        headers = {}
-        if "retry-after" in response.headers:
-            headers["retry-after"] = response.headers["retry-after"]
-        try:
-            return JSONResponse(json.loads(body), status_code=response.status_code, headers=headers)
-        except json.JSONDecodeError:
-            return error(
-                response.status_code,
-                "upstream_error",
-                body.decode(errors="replace")[:500],
-                headers,
-            )
+        # What was tried, in order. Without it a 502 from a two-provider
+        # gateway is indistinguishable from a 502 from a one-provider one.
+        routed.failure.headers["x-quotagate-attempts"] = record.attempts
+        return routed.failure
 
+    response = routed.response
+    record.upstream = routed.provider.name
     limit_headers = decision.headers(KEY_LIMIT) if decision is not None else {}
+    limit_headers["x-quotagate-provider"] = routed.provider.name
+    limit_headers["x-quotagate-attempts"] = record.attempts
 
     if wants_stream:
         return StreamingResponse(

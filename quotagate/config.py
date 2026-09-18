@@ -92,3 +92,59 @@ def load_limits() -> LimitSettings:
 
 
 limits = load_limits()
+
+
+@dataclass(frozen=True)
+class ResilienceSettings:
+    """Thresholds worth tuning per deployment without a code change."""
+
+    breaker_threshold: int
+    breaker_cooldown: float
+    retry_ratio: float
+    retry_burst: float
+
+
+def load_resilience() -> ResilienceSettings:
+    return ResilienceSettings(
+        breaker_threshold=_int_env("QUOTAGATE_BREAKER_THRESHOLD", 5),
+        breaker_cooldown=_float_env("QUOTAGATE_BREAKER_COOLDOWN", 20.0),
+        retry_ratio=_float_env("QUOTAGATE_RETRY_RATIO", 0.2),
+        retry_burst=_float_env("QUOTAGATE_RETRY_BURST", 5.0),
+    )
+
+
+resilience = load_resilience()
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    name: str
+    base_url: str
+    api_key: str | None
+
+
+def load_providers() -> list[ProviderSpec]:
+    """Providers in preference order.
+
+    `QUOTAGATE_PROVIDERS=groq,openrouter` plus `QUOTAGATE_PROVIDER_GROQ_URL`
+    and `QUOTAGATE_PROVIDER_GROQ_KEY` for each. With nothing set, the single
+    upstream from `QUOTAGATE_UPSTREAM_*` is the only provider, so a deployment
+    that never wanted failover keeps working unchanged.
+    """
+    names = [n.strip() for n in os.environ.get("QUOTAGATE_PROVIDERS", "").split(",") if n.strip()]
+    if not names:
+        return [ProviderSpec(settings.upstream_name, settings.upstream_base_url, settings.upstream_api_key)]
+
+    specs: list[ProviderSpec] = []
+    for name in names:
+        prefix = f"QUOTAGATE_PROVIDER_{name.upper().replace('-', '_')}"
+        url = os.environ.get(f"{prefix}_URL")
+        if not url:
+            continue  # a named provider with no URL is a typo, not a provider
+        specs.append(ProviderSpec(name, url.rstrip("/"), os.environ.get(f"{prefix}_KEY") or None))
+    return specs or [
+        ProviderSpec(settings.upstream_name, settings.upstream_base_url, settings.upstream_api_key)
+    ]
+
+
+providers = load_providers()

@@ -10,17 +10,26 @@ model.
     fake-500            provider error with a non-JSON body
     fake-die            two chunks, then the connection drops mid-stream
     fake-slow           first chunk arrives after a long pause
+    fake-400            the caller's request is wrong, not the provider's fault
+
+Prefixing a mode with a provider name ("alpha:fake-500") aims it at that
+provider only; every other provider treats the request as normal. Without that,
+two fakes standing in for two providers would fail in lockstep and no failover
+could ever be observed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+NAME = os.environ.get("FAKE_NAME", "fake")
 
 app = FastAPI(title="fake-upstream")
 
@@ -58,13 +67,20 @@ async def _stream(model: str) -> AsyncIterator[str]:
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Response:
     payload = await request.json()
-    model = str(payload.get("model", "fake"))
+    requested = str(payload.get("model", "fake"))
+    target, separator, mode = requested.partition(":")
+    model = (mode if target == NAME else "fake") if separator else requested
 
     if model == "fake-429":
         return JSONResponse(
             {"error": {"message": "rate limit reached", "type": "rate_limit_exceeded"}},
             status_code=429,
             headers={"retry-after": "3"},
+        )
+    if model == "fake-400":
+        return JSONResponse(
+            {"error": {"message": "unknown parameter", "type": "invalid_request_error"}},
+            status_code=400,
         )
     if model == "fake-500":
         return Response("upstream exploded", status_code=500, media_type="text/plain")
@@ -79,6 +95,7 @@ async def chat_completions(request: Request) -> Response:
             "id": "chatcmpl-fake",
             "object": "chat.completion",
             "model": model,
+            "answered_by": NAME,
             "choices": [
                 {
                     "index": 0,

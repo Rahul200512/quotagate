@@ -45,14 +45,16 @@ the gateway moves to Render and the Vercel project keeps only the front page.
 against three local copies and against the deployment; limiter latency cost;
 behaviour with Redis switched off.
 
-## v2 — failure is the normal case
+## v2 — failure is the normal case (in progress)
 
-- Second provider (OpenRouter), health-aware routing, failover before the first
-  byte only — a half-sent stream cannot be retried onto another provider
-- Circuit breaker state in Redis so every copy sees it
-- Retry budget across requests instead of per-request retries
-- Deadlines propagated to the upstream call
-- A fake upstream that stalls, 500s, 429s and dies mid-stream
+- [x] Provider order with failover before the first byte only
+- [x] 4xx returned unchanged; 5xx, 429 and unreachable move on
+- [x] Circuit breaker per provider, with a single trial call after cooldown
+- [x] Retry budget as a fraction of traffic, not per request
+- [x] `x-quotagate-provider` and `x-quotagate-attempts` on every response
+- [x] A fake upstream that stalls, 500s, 429s, 400s and dies mid-stream
+- [ ] Breaker and budget state in Redis, shared across copies
+- [ ] A real second provider (OpenRouter) rather than a second fake
 
 **Measured:** success rate and time-to-first-token under each injected fault,
 with and without each mechanism.
