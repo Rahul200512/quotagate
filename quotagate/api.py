@@ -20,6 +20,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 
 from quotagate import __version__, upstream
 from quotagate.page import INDEX_HTML
+from quotagate.cache import Cache, Entry, InMemoryCache, is_cacheable, key_for
+from quotagate.config import cache as cache_settings
 from quotagate.config import limits as limit_settings
 from quotagate.config import providers as provider_specs
 from quotagate.config import resilience
@@ -89,6 +91,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.upstream = app.state.providers[0].client
     app.state.keys = parse_keys(settings.keys_raw)
     app.state.buckets = build_buckets()
+    app.state.cache = InMemoryCache()
     app.state.retry_budget = RetryBudget(
         ratio=resilience.retry_ratio, burst=resilience.retry_burst, tokens=resilience.retry_burst
     )
@@ -258,6 +261,15 @@ async def chat_completions(request: Request) -> Response:
     if not isinstance(payload, dict) or not payload.get("model") or not payload.get("messages"):
         return error(400, "invalid_request", "`model` and `messages` are required")
 
+    wants_stream = bool(payload.get("stream"))
+    record = RequestRecord(
+        key_name=key.name,
+        model=str(payload.get("model")),
+        streamed=wants_stream,
+        upstream=settings.upstream_name,
+    )
+    started = time.perf_counter()
+
     scopes = scopes_for(key)
     buckets: Buckets = request.app.state.buckets
     reserved = estimate_cost(payload)
@@ -283,27 +295,59 @@ async def chat_completions(request: Request) -> Response:
             decision.headers(KEY_LIMIT),
         )
 
-    wants_stream = bool(payload.get("stream"))
+    cache: Cache = request.app.state.cache
+    cacheable = cache_settings.enabled and is_cacheable(payload)
+    cache_key = key_for(payload) if cacheable else ""
+
+    if cacheable:
+        hit = await cache.get(cache_key)
+        if hit is not None and hit.streamed == wants_stream:
+            # A hit spends no provider tokens, so the reservation is handed
+            # straight back. The request itself still counts: a caller looping
+            # on one prompt is still traffic.
+            if decision is not None and decision.reserved:
+                await buckets.reconcile(scopes, decision.reserved, 0)
+            record.finish(200, "cache_hit", started)
+            record.bytes_out = len(hit.body)
+            record.emit()
+            headers = {"x-quotagate-cache": "hit"}
+            if decision is not None:
+                headers.update(decision.headers(KEY_LIMIT))
+            if hit.streamed:
+                return StreamingResponse(
+                    iter([hit.body]),
+                    media_type="text/event-stream",
+                    headers={**STREAM_HEADERS, **headers},
+                )
+            return Response(
+                content=hit.body,
+                status_code=hit.status,
+                media_type="application/json",
+                headers=headers,
+            )
+
     if wants_stream and "stream_options" not in payload:
         # Without this the provider sends no usage frame, and every streamed
         # call would settle against an estimate instead of the real cost. The
         # caller sees one extra final frame, which OpenAI's own clients expect.
         payload["stream_options"] = {"include_usage": True}
 
+    captured = (
+        upstream.Capture(cache_settings.max_bytes) if cacheable and wants_stream else None
+    )
+
     async def settle(completed: RequestRecord) -> None:
+        if captured is not None and captured.body:
+            await cache.set(
+                cache_key,
+                Entry(body=captured.body, streamed=True, status=200),
+                cache_settings.ttl_seconds,
+            )
         if decision is None or not decision.reserved:
             return
         actual = (completed.prompt_tokens or 0) + (completed.completion_tokens or 0)
         if actual:
             await buckets.reconcile(scopes, decision.reserved, actual)
-
-    record = RequestRecord(
-        key_name=key.name,
-        model=str(payload.get("model")),
-        streamed=wants_stream,
-        upstream=settings.upstream_name,
-    )
-    started = time.perf_counter()
 
     routed = await route(request.app, payload)
     record.attempts = ",".join(attempt.as_text() for attempt in routed.attempts)
@@ -321,10 +365,11 @@ async def chat_completions(request: Request) -> Response:
     limit_headers = decision.headers(KEY_LIMIT) if decision is not None else {}
     limit_headers["x-quotagate-provider"] = routed.provider.name
     limit_headers["x-quotagate-attempts"] = record.attempts
+    limit_headers["x-quotagate-cache"] = "miss" if cacheable else "skip"
 
     if wants_stream:
         return StreamingResponse(
-            upstream.relay(response, record, started, on_finish=settle),
+            upstream.relay(response, record, started, on_finish=settle, capture=captured),
             media_type="text/event-stream",
             headers={**STREAM_HEADERS, **limit_headers},
         )
@@ -345,6 +390,12 @@ async def chat_completions(request: Request) -> Response:
     record.finish(response.status_code, "ok", started)
     record.emit()
     await settle(record)
+    if cacheable and len(body) <= cache_settings.max_bytes:
+        await cache.set(
+            cache_key,
+            Entry(body=body, streamed=False, status=response.status_code),
+            cache_settings.ttl_seconds,
+        )
     return JSONResponse(parsed, status_code=response.status_code, headers=limit_headers)
 
 

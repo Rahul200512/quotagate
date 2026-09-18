@@ -64,7 +64,10 @@ with and without each mechanism.
 - OpenTelemetry traces to Grafana Cloud: limiter, cache, provider, per request
 - Per-key token and cost accounting, plus a reconciliation query that proves
   the rollups match the request log
-- Exact-match response cache in Redis for deterministic requests
+- [x] Exact-match response cache, per-process, for deterministic requests only
+- [x] A hit refunds the token reservation; the request still counts
+- [ ] The same cache in Redis, shared across copies
+- [ ] Hit rate measured on BumpCheck's real traffic
 - A written SLO and a burn-rate alert
 - BumpCheck's model calls move behind the gateway — its first real client
 

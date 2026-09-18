@@ -250,6 +250,46 @@ Caveats, honestly:
   faster reply would cut tail latency and double the spend; on a free tier that
   trade is not available.
 
+## v3 — answering twice for free (in progress)
+
+A repeated question that pinned its sampling has exactly one right answer, so
+the second caller gets the first caller's bytes. Only requests that declared
+themselves deterministic qualify — `temperature: 0`, no tools, no `n` — because
+anything else may legitimately differ next time.
+
+| Request | Cached? |
+|---|---|
+| `temperature: 0` | yes |
+| no `temperature` | no — that means the provider's default, not zero |
+| `temperature: 0.9` | no |
+| tools, `n > 1` | no — the reply can differ every time |
+
+The key covers model, messages and every sampling parameter; anything left out
+of a cache key is a way for two different questions to collide on one answer.
+`stream` is deliberately not in the key — the same question has the same answer
+whether it is streamed or buffered — but the two shapes are stored separately,
+because handing a streaming SDK a buffered body gives it something it cannot
+parse. Streamed replies are stored as the exact bytes that were relayed and
+replayed as-is, so a cached stream and a live one are the same stream, faster.
+
+**A hit refunds the token reservation**, because no provider call happened. The
+request itself still counts against the caller's rate: a client looping on one
+prompt is still traffic.
+
+Every response says which it was: `x-quotagate-cache: hit | miss | skip`.
+
+Reproduce: `.venv/bin/python -m pytest tests/test_cache.py -q`.
+
+Caveats, honestly:
+
+- **The cache is per-process and bounded** (256 entries, 5 minutes). On Vercel
+  that means a hit needs the same instance to answer both calls, so the hit
+  rate in production will be well below what a single laptop process suggests.
+  The shared version lands with Redis.
+- **No hit-rate number yet.** Measuring it honestly needs real repeated traffic,
+  which arrives when BumpCheck starts calling the gateway.
+- **Bodies over 256 KB stream to the caller but are not stored.**
+
 ## What's next
 
 Verifying the Redis path against a real Redis, then deploying. See [ROADMAP.md](ROADMAP.md), including what I decided

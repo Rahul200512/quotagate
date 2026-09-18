@@ -31,6 +31,35 @@ from quotagate.requestlog import RequestRecord
 TAIL_BYTES = 8 * 1024
 
 
+class Capture:
+    """Collect a streamed body for the cache, and give up if it grows too big.
+
+    Giving up matters more than collecting: a cache is an optimisation, and an
+    unbounded buffer in front of a streaming response would trade a latency win
+    for a memory leak.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._chunks: list[bytes] = []
+        self._size = 0
+        self._limit = limit
+        self.abandoned = False
+
+    def add(self, chunk: bytes) -> None:
+        if self.abandoned:
+            return
+        self._size += len(chunk)
+        if self._size > self._limit:
+            self.abandoned = True
+            self._chunks.clear()
+            return
+        self._chunks.append(chunk)
+
+    @property
+    def body(self) -> bytes | None:
+        return None if self.abandoned else b"".join(self._chunks)
+
+
 class UpstreamUnavailable(Exception):
     """The provider could not be reached, or went silent mid-stream."""
 
@@ -115,6 +144,7 @@ async def relay(
     record: RequestRecord,
     started: float,
     on_finish: Callable[[RequestRecord], Awaitable[None]] | None = None,
+    capture: Capture | None = None,
 ) -> AsyncIterator[bytes]:
     """Hand provider bytes to the caller as they arrive, then log.
 
@@ -133,6 +163,8 @@ async def relay(
             record.chunks += 1
             record.bytes_out += len(chunk)
             tail = (tail + chunk)[-TAIL_BYTES:]
+            if capture is not None:
+                capture.add(chunk)
             yield chunk
     except GeneratorExit:
         outcome = "client_disconnect"

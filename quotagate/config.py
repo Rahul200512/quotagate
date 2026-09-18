@@ -95,6 +95,26 @@ limits = load_limits()
 
 
 @dataclass(frozen=True)
+class CacheSettings:
+    enabled: bool
+    ttl_seconds: int
+    # A reply larger than this is streamed to the caller but not stored; the
+    # memory a cache may hold has to be bounded by something.
+    max_bytes: int
+
+
+def load_cache() -> CacheSettings:
+    return CacheSettings(
+        enabled=os.environ.get("QUOTAGATE_CACHE", "on").lower() not in {"0", "off", "false"},
+        ttl_seconds=_int_env("QUOTAGATE_CACHE_TTL", 300),
+        max_bytes=_int_env("QUOTAGATE_CACHE_MAX_BYTES", 256 * 1024),
+    )
+
+
+cache = load_cache()
+
+
+@dataclass(frozen=True)
 class ResilienceSettings:
     """Thresholds worth tuning per deployment without a code change."""
 
