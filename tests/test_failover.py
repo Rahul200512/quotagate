@@ -151,3 +151,61 @@ def test_the_retry_budget_stops_a_stampede_when_everything_is_failing() -> None:
 
     assert any("no_retry_budget" in attempt for attempt in attempts), attempts
     assert attempts[0].count("cannot reach") == 2, "the first request should still try both"
+
+
+def test_a_model_only_the_backup_serves_goes_straight_to_the_backup(alpha: str, beta: str) -> None:
+    """Providers name the same weights differently; asking the wrong one 404s."""
+    env = env_for(
+        alpha,
+        beta,
+        QUOTAGATE_PROVIDER_ALPHA_MODELS="house-model=fake",
+        QUOTAGATE_PROVIDER_BETA_MODELS="house-model=fake,rare-model=fake",
+    )
+    with running("app:app", env=env) as url:
+        common = post(url, body("house-model"))
+        rare = post(url, body("rare-model"))
+
+    assert common.headers["x-quotagate-provider"] == "alpha"
+    assert rare.status_code == 200
+    assert rare.headers["x-quotagate-provider"] == "beta"
+    assert rare.headers["x-quotagate-attempts"] == "alpha:skipped(model_unavailable),beta:200"
+
+
+def test_the_id_the_provider_knows_is_the_one_it_is_sent(alpha: str, beta: str) -> None:
+    env = env_for(alpha, beta, QUOTAGATE_PROVIDER_ALPHA_MODELS="house-model=alpha:fake")
+    with running("app:app", env=env) as url:
+        response = post(url, body("house-model"))
+
+    assert response.status_code == 200
+    # The fake echoes back the model it was actually asked for.
+    assert response.json()["model"] == "fake"
+    assert response.json()["answered_by"] == "alpha"
+
+
+def test_a_model_no_provider_serves_is_a_404_not_a_dead_end(alpha: str, beta: str) -> None:
+    env = env_for(
+        alpha,
+        beta,
+        QUOTAGATE_PROVIDER_ALPHA_MODELS="house-model=fake",
+        QUOTAGATE_PROVIDER_BETA_MODELS="house-model=fake",
+    )
+    with running("app:app", env=env) as url:
+        response = post(url, body("nobody-has-this"))
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "model_not_found"
+    assert "skipped(model_unavailable)" in response.headers["x-quotagate-attempts"]
+
+
+def test_skipping_for_a_missing_model_does_not_count_against_the_provider(
+    alpha: str, beta: str
+) -> None:
+    """A model this provider never had is not evidence that it is unhealthy."""
+    env = env_for(alpha, beta, QUOTAGATE_PROVIDER_ALPHA_MODELS="house-model=fake")
+    with running("app:app", env=env) as url:
+        for _ in range(8):
+            post(url, body("rare-model"))
+        health = httpx.get(f"{url}/healthz", timeout=10).json()
+
+    circuits = {p["name"]: p["circuit"] for p in health["providers"]}
+    assert circuits["alpha"] == "closed"

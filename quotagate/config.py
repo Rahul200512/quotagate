@@ -141,11 +141,29 @@ def load_resilience() -> ResilienceSettings:
 resilience = load_resilience()
 
 
+def parse_models(raw: str) -> dict[str, str]:
+    """`asked=served,asked=served` — what this provider calls each model.
+
+    Providers name the same weights differently, and a provider that has never
+    heard of an id answers 404 rather than failing over usefully. An empty map
+    means "send the id through unchanged", which is right for the provider the
+    caller is naming models for.
+    """
+    mapping: dict[str, str] = {}
+    for pair in raw.split(","):
+        asked, _, served = pair.partition("=")
+        asked, served = asked.strip(), served.strip()
+        if asked and served:
+            mapping[asked] = served
+    return mapping
+
+
 @dataclass(frozen=True)
 class ProviderSpec:
     name: str
     base_url: str
     api_key: str | None
+    models: dict[str, str]
 
 
 def load_providers() -> list[ProviderSpec]:
@@ -158,7 +176,11 @@ def load_providers() -> list[ProviderSpec]:
     """
     names = [n.strip() for n in os.environ.get("QUOTAGATE_PROVIDERS", "").split(",") if n.strip()]
     if not names:
-        return [ProviderSpec(settings.upstream_name, settings.upstream_base_url, settings.upstream_api_key)]
+        return [
+            ProviderSpec(
+                settings.upstream_name, settings.upstream_base_url, settings.upstream_api_key, {}
+            )
+        ]
 
     specs: list[ProviderSpec] = []
     for name in names:
@@ -166,9 +188,18 @@ def load_providers() -> list[ProviderSpec]:
         url = os.environ.get(f"{prefix}_URL")
         if not url:
             continue  # a named provider with no URL is a typo, not a provider
-        specs.append(ProviderSpec(name, url.rstrip("/"), os.environ.get(f"{prefix}_KEY") or None))
+        specs.append(
+            ProviderSpec(
+                name=name,
+                base_url=url.rstrip("/"),
+                api_key=os.environ.get(f"{prefix}_KEY") or None,
+                models=parse_models(os.environ.get(f"{prefix}_MODELS", "")),
+            )
+        )
     return specs or [
-        ProviderSpec(settings.upstream_name, settings.upstream_base_url, settings.upstream_api_key)
+        ProviderSpec(
+            settings.upstream_name, settings.upstream_base_url, settings.upstream_api_key, {}
+        )
     ]
 
 

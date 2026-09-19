@@ -56,7 +56,8 @@ behaviour with Redis switched off.
 - [x] A fake upstream that stalls, 500s, 429s, 400s and dies mid-stream
 - [ ] Breaker and budget state in Redis, shared across copies
 - [x] A real second provider: Groq unreachable, OpenRouter answered
-- [ ] Per-provider model mapping, so failover survives a provider-specific id
+- [x] Per-provider model mapping, so failover survives a provider-specific id
+- [ ] Reconcile the map against each provider's models endpoint on a schedule
 
 **Measured:** success rate and time-to-first-token under each injected fault,
 with and without each mechanism.

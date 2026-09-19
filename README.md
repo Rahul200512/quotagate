@@ -251,6 +251,21 @@ What is worth moving on for, and what is not:
 | 4xx | return it unchanged | the request is wrong; a second provider would reject it identically, and this is not the provider's fault |
 | died mid-stream | end the stream | see above |
 
+**Providers do not agree on what a model is called.** Groq serves
+`qwen/qwen3.8-27b`; OpenRouter calls the same weights `qwen/qwen3.8-27b:free`.
+Worse, some models exist on only one of them. So each provider carries a map of
+what it serves: `QUOTAGATE_PROVIDER_OPENROUTER_MODELS="asked=served,..."`. A
+provider with a map that doesn't list the model is skipped, without spending a
+retry and without counting against its circuit — never having a model is not
+evidence that a provider is unhealthy. A provider with no map gets the id
+unchanged, which is right for the one the caller is naming models for.
+
+| Asked for | What happens |
+|---|---|
+| a model both providers map | either can answer; failover is real |
+| a model only the backup maps | the primary is skipped, not asked and 404'd |
+| a model nobody maps | `404 model_not_found` from the gateway, or the provider's own 404 if one could have served it |
+
 Two protections sit on top, and they protect the *provider* as much as the
 caller — a gateway that retries everything doubles a provider's traffic exactly
 when it is failing:
@@ -288,10 +303,12 @@ Caveats, honestly:
   defensible — each copy learns from what it saw. For the budget it is not: N
   copies allow N times the retries. Both move into Redis once v1's shared
   buckets are verified against a real Redis.
-- **Failover needs a model both providers serve.** `openai/gpt-oss-20b` exists
-  on Groq and on OpenRouter, which is why the pair works; a Groq-only model id
-  would fail over into a 404. Per-provider model mapping is not built yet, and
-  the roadmap says so.
+- **The model map is configuration, not discovery.** Both providers publish a
+  models endpoint, and the gateway could reconcile itself against them on a
+  schedule. Today the map is an environment variable I maintain by hand, so a
+  model retired upstream is a 404 until I notice. `tests/test_live_services.py`
+  fails when the id in the docs stops existing, which is the cheap half of the
+  fix.
 - **No hedging.** Sending the same request to two providers and taking the
   faster reply would cut tail latency and double the spend; on a free tier that
   trade is not available.

@@ -31,6 +31,19 @@ class Provider:
     api_key: str | None
     client: httpx.AsyncClient | None = None
     breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
+    # What this provider calls each model. Empty means "send it unchanged".
+    models: dict[str, str] = field(default_factory=dict)
+
+    def serves(self, model: str) -> str | None:
+        """The id this provider knows the model by, or None if it has none.
+
+        A provider with a map is making a claim about what it serves, so an
+        unlisted model means skip it — asking anyway would trade a useful
+        failover for a 404 and an opened circuit.
+        """
+        if not self.models:
+            return model
+        return self.models.get(model)
 
 
 RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}

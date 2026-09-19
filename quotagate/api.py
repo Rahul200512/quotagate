@@ -81,6 +81,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             base_url=spec.base_url,
             api_key=spec.api_key,
             client=upstream.build_client(settings, spec.base_url),
+            models=spec.models,
             breaker=CircuitBreaker(
                 threshold=resilience.breaker_threshold, cooldown=resilience.breaker_cooldown
             ),
@@ -132,6 +133,7 @@ async def route(app: FastAPI, payload: dict) -> Routed:
     budget.record_request()
     attempts: list[Attempt] = []
     last_failure: Response | None = None
+    requested_model = str(payload.get("model", ""))
 
     for index, provider in enumerate(app.state.providers):
         if index and not budget.try_spend():
@@ -143,9 +145,18 @@ async def route(app: FastAPI, payload: dict) -> Routed:
             attempts.append(Attempt(provider.name, skipped=True, error="circuit_open"))
             continue
 
+        served_as = provider.serves(requested_model)
+        if served_as is None:
+            # Not a failure of this provider — it simply does not have the
+            # model — so the circuit stays closed and no retry budget is spent.
+            attempts.append(Attempt(provider.name, skipped=True, error="model_unavailable"))
+            continue
+
+        attempt_payload = payload if served_as == requested_model else {**payload, "model": served_as}
+
         try:
             response = await upstream.open_stream(
-                provider.client, settings, payload, provider.api_key, provider.name
+                provider.client, settings, attempt_payload, provider.api_key, provider.name
             )
         except UpstreamUnavailable as exc:
             provider.breaker.record_failure()
@@ -179,6 +190,14 @@ async def route(app: FastAPI, payload: dict) -> Routed:
             failure.headers[name] = value
         last_failure = failure
 
+    if last_failure is None:
+        served_by_none = all(a.error == "model_unavailable" for a in attempts) and attempts
+        if served_by_none:
+            last_failure = error(
+                404,
+                "model_not_found",
+                f"no configured provider serves `{requested_model}`",
+            )
     return Routed(
         attempts=attempts,
         failure=last_failure
