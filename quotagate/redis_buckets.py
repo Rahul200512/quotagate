@@ -99,6 +99,8 @@ TTL_SECONDS = 180
 class Transport(Protocol):
     async def eval(self, script: str, keys: list[str], args: list[str]) -> Any: ...
 
+    async def command(self, *args: str) -> Any: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -113,9 +115,11 @@ class RestTransport:
         )
 
     async def eval(self, script: str, keys: list[str], args: list[str]) -> Any:
-        command = ["EVAL", script, str(len(keys)), *keys, *args]
+        return await self.command("EVAL", script, str(len(keys)), *keys, *args)
+
+    async def command(self, *args: str) -> Any:
         response = await self._client.post(
-            self._url, json=command, headers={"authorization": f"Bearer {self._token}"}
+            self._url, json=list(args), headers={"authorization": f"Bearer {self._token}"}
         )
         response.raise_for_status()
         return response.json().get("result")
@@ -134,6 +138,9 @@ class TcpTransport:
 
     async def eval(self, script: str, keys: list[str], args: list[str]) -> Any:
         return await self._client.eval(script, len(keys), *keys, *args)
+
+    async def command(self, *args: str) -> Any:
+        return await self._client.execute_command(*args)
 
     async def aclose(self) -> None:
         await self._client.aclose()

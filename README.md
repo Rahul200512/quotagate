@@ -299,10 +299,19 @@ a provider name (`alpha:fake-500`) makes only that one misbehave.
 
 Caveats, honestly:
 
-- **The breaker and the budget are per-process.** For a breaker that is
-  defensible — each copy learns from what it saw. For the budget it is not: N
-  copies allow N times the retries. Both move into Redis once v1's shared
-  buckets are verified against a real Redis.
+- **The retry budget is now shared; the breaker is not.** The shared budget
+  refills from the clock — a flat ceiling of retries a minute — rather than
+  earning a fraction of a retry per request, because the traffic-based rule
+  would cost a Redis write on every single request: paying a round trip on the
+  happy path to police the unhappy one. Under steady traffic the two land in
+  the same place; under a burst the shared one is stricter, which is the
+  direction to be wrong in. If Redis cannot be reached, no retry happens: the
+  first attempt has already been made, and failing to reach the limiter must
+  not turn one failing call into two.
+- **The circuit breaker is still per-process**, and that one I can defend: each
+  copy learns from calls it actually made, and a provider that is down fails
+  everyone's first attempt quickly. Sharing it would cost a read per provider
+  per request to save a handful of doomed calls.
 - **The model map is configuration, not discovery.** Both providers publish a
   models endpoint, and the gateway could reconcile itself against them on a
   schedule. Today the map is an environment variable I maintain by hand, so a
@@ -345,10 +354,16 @@ Reproduce: `.venv/bin/python -m pytest tests/test_cache.py -q`.
 
 Caveats, honestly:
 
-- **The cache is per-process and bounded** (256 entries, 5 minutes). On Vercel
-  that means a hit needs the same instance to answer both calls, so the hit
-  rate in production will be well below what a single laptop process suggests.
-  The shared version lands with Redis.
+- **The cache is shared when Redis is configured**, per-process and bounded
+  (256 entries) when it is not. On Vercel that distinction is the difference
+  between a cache and a coincidence: consecutive requests routinely land on
+  different instances, so a per-process hit needs luck. Bodies are base64'd
+  inside a small JSON envelope — SSE frames are text, but a provider may send
+  bytes that are not valid UTF-8, and a cache that corrupts one reply in ten
+  thousand is worse than no cache.
+- **`/healthz` names what is shared**: `limits`, `cache` and `retry_budget`
+  each report `shared` or `per-process`, because a missing environment variable
+  should not quietly change what a limit means.
 - **No hit-rate number yet.** Measuring it honestly needs real repeated traffic,
   which arrives when BumpCheck starts calling the gateway.
 - **Bodies over 256 KB stream to the caller but are not stored.**

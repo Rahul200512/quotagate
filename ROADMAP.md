@@ -54,7 +54,11 @@ behaviour with Redis switched off.
 - [x] Retry budget as a fraction of traffic, not per request
 - [x] `x-quotagate-provider` and `x-quotagate-attempts` on every response
 - [x] A fake upstream that stalls, 500s, 429s, 400s and dies mid-stream
-- [ ] Breaker and budget state in Redis, shared across copies
+- [x] Retry budget in Redis, shared across copies (clock-refilled, not
+      traffic-earned — see the README for why)
+- [ ] Breaker state in Redis — deferred on purpose; the README argues a
+      per-process breaker is defensible and a shared one costs a read per
+      provider per request
 - [x] A real second provider: Groq unreachable, OpenRouter answered
 - [x] Per-provider model mapping, so failover survives a provider-specific id
 - [ ] Reconcile the map against each provider's models endpoint on a schedule
@@ -69,7 +73,7 @@ with and without each mechanism.
   the rollups match the request log
 - [x] Exact-match response cache, per-process, for deterministic requests only
 - [x] A hit refunds the token reservation; the request still counts
-- [ ] The same cache in Redis, shared across copies
+- [x] The same cache in Redis, shared across copies
 - [ ] Hit rate measured on BumpCheck's real traffic
 - A written SLO and a burn-rate alert
 - BumpCheck's model calls move behind the gateway — its first real client

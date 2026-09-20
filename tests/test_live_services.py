@@ -150,3 +150,62 @@ def test_a_real_streamed_completion_arrives_in_pieces() -> None:
 
     assert len(arrivals) > 20, "a reply this long should arrive as many frames"
     assert arrivals[-1] - arrivals[0] > 10, "a whole reply in one instant means it was buffered"
+
+
+@needs_redis
+@pytest.mark.asyncio
+async def test_a_cached_reply_crosses_from_one_copy_to_another() -> None:
+    """The point of a shared cache: instance A's answer serves instance B.
+
+    On Vercel, consecutive requests routinely land on different instances, so
+    a per-process cache is closer to a coincidence than a cache.
+    """
+    from quotagate.cache import Entry, RedisCache
+
+    namespace = f"t{uuid.uuid4().hex[:8]}"
+    writer = RedisCache(RestTransport(REDIS_URL, REDIS_TOKEN), namespace=namespace)
+    reader = RedisCache(RestTransport(REDIS_URL, REDIS_TOKEN), namespace=namespace)
+
+    body = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'
+    await writer.set("shared-key", Entry(body=body, streamed=True, status=200), ttl=60)
+    found = await reader.get("shared-key")
+    missing = await reader.get("never-written")
+
+    assert found is not None
+    assert found.body == body, "the bytes must survive the round trip exactly"
+    assert found.streamed is True
+    assert missing is None
+
+
+@needs_redis
+@pytest.mark.asyncio
+async def test_the_shared_retry_budget_runs_out_for_everyone() -> None:
+    """Two copies draw retries from one allowance, not one each."""
+    from quotagate.resilience import SharedRetryBudget
+
+    namespace = f"t{uuid.uuid4().hex[:8]}"
+    copies = [
+        SharedRetryBudget(
+            RestTransport(REDIS_URL, REDIS_TOKEN),
+            retries_per_minute=1,
+            burst=3,
+            namespace=namespace,
+        )
+        for _ in range(2)
+    ]
+
+    spent = 0
+    for index in range(8):
+        spent += await copies[index % 2].try_spend()
+
+    assert spent == 3, "the burst is the deployment's, not each copy's"
+
+
+@needs_redis
+@pytest.mark.asyncio
+async def test_a_retry_is_refused_when_the_budget_store_is_unreachable() -> None:
+    """Failing to reach the limiter must not turn one failing call into two."""
+    from quotagate.resilience import SharedRetryBudget
+
+    budget = SharedRetryBudget(RestTransport("http://127.0.0.1:1", "x"), retries_per_minute=60)
+    assert await budget.try_spend() is False

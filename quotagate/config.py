@@ -127,6 +127,9 @@ class ResilienceSettings:
     breaker_cooldown: float
     retry_ratio: float
     retry_burst: float
+    # The shared budget refills from the clock, so it needs a rate of its own
+    # rather than a fraction of traffic.
+    retry_per_minute: float
 
 
 def load_resilience() -> ResilienceSettings:
@@ -135,6 +138,7 @@ def load_resilience() -> ResilienceSettings:
         breaker_cooldown=_float_env("QUOTAGATE_BREAKER_COOLDOWN", 20.0),
         retry_ratio=_float_env("QUOTAGATE_RETRY_RATIO", 0.2),
         retry_burst=_float_env("QUOTAGATE_RETRY_BURST", 5.0),
+        retry_per_minute=_float_env("QUOTAGATE_RETRY_PER_MINUTE", 12.0),
     )
 
 

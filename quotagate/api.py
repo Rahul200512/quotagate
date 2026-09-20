@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 
 from quotagate import __version__, upstream
 from quotagate.page import render as render_page
-from quotagate.cache import Cache, Entry, InMemoryCache, is_cacheable, key_for
+from quotagate.cache import Cache, Entry, InMemoryCache, RedisCache, is_cacheable, key_for
 from quotagate.config import cache as cache_settings
 from quotagate.config import limits as limit_settings
 from quotagate.config import providers as provider_specs
@@ -29,7 +29,7 @@ from quotagate.config import settings
 from quotagate.keys import ApiKey, bearer_token, find, parse_keys
 from quotagate.limits import Buckets, InMemoryBuckets, Limit, Scope, estimate_cost
 from quotagate.providers import Attempt, Provider, should_try_another
-from quotagate.resilience import CircuitBreaker, RetryBudget
+from quotagate.resilience import CircuitBreaker, RetryBudget, SharedRetryBudget
 from quotagate.redis_buckets import RedisBuckets, RestTransport, TcpTransport
 from quotagate.requestlog import RequestRecord
 from quotagate.upstream import UpstreamUnavailable
@@ -52,20 +52,20 @@ KEY_LIMIT = Limit(limit_settings.key_rpm, limit_settings.key_tpm)
 ACCOUNT_LIMIT = Limit(limit_settings.account_rpm, limit_settings.account_tpm)
 
 
-def build_buckets() -> Buckets:
-    """Shared buckets when Redis is configured, per-process ones when not.
+def build_transport():
+    """One Redis connection for every shared thing, or None when unconfigured.
 
-    The in-memory fallback is not a degraded mode of the same guarantee — it is
-    a different, weaker one, so `/healthz` reports which is in force rather than
-    letting a missing environment variable quietly halve the limits' meaning.
+    The limiter, the cache and the retry budget all speak to the same store, so
+    they share a transport rather than each opening their own. The per-process
+    fallbacks are not a degraded mode of the same guarantee — they are weaker,
+    different ones, which is why `/healthz` names which is in force rather than
+    letting a missing environment variable quietly change what a limit means.
     """
     if limit_settings.redis_rest_url and limit_settings.redis_rest_token:
-        return RedisBuckets(
-            RestTransport(limit_settings.redis_rest_url, limit_settings.redis_rest_token)
-        )
+        return RestTransport(limit_settings.redis_rest_url, limit_settings.redis_rest_token)
     if limit_settings.redis_url:
-        return RedisBuckets(TcpTransport(limit_settings.redis_url))
-    return InMemoryBuckets()
+        return TcpTransport(limit_settings.redis_url)
+    return None
 
 
 def scopes_for(key: ApiKey) -> list[Scope]:
@@ -91,10 +91,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Kept for /v1/models, which asks the first provider only.
     app.state.upstream = app.state.providers[0].client
     app.state.keys = parse_keys(settings.keys_raw)
-    app.state.buckets = build_buckets()
-    app.state.cache = InMemoryCache()
-    app.state.retry_budget = RetryBudget(
-        ratio=resilience.retry_ratio, burst=resilience.retry_burst, tokens=resilience.retry_burst
+    transport = build_transport()
+    app.state.shared = transport is not None
+    app.state.buckets = RedisBuckets(transport) if transport else InMemoryBuckets()
+    app.state.cache = RedisCache(transport) if transport else InMemoryCache()
+    app.state.retry_budget = (
+        SharedRetryBudget(
+            transport, retries_per_minute=resilience.retry_per_minute, burst=resilience.retry_burst
+        )
+        if transport
+        else RetryBudget(
+            ratio=resilience.retry_ratio,
+            burst=resilience.retry_burst,
+            tokens=resilience.retry_burst,
+        )
     )
     try:
         yield
@@ -136,7 +146,7 @@ async def route(app: FastAPI, payload: dict) -> Routed:
     requested_model = str(payload.get("model", ""))
 
     for index, provider in enumerate(app.state.providers):
-        if index and not budget.try_spend():
+        if index and not await budget.try_spend():
             # A broad outage should degrade into fast failures, not a stampede
             # of retries arriving at whichever provider is still standing.
             attempts.append(Attempt(provider.name, skipped=True, error="no_retry_budget"))
@@ -254,6 +264,8 @@ async def healthz() -> JSONResponse:
                 # "per-process" is a weaker promise than "shared", so it is
                 # reported rather than hidden behind the same word.
                 "scope": "shared" if limit_settings.shared else "per-process",
+                "cache": "shared" if limit_settings.shared else "per-process",
+                "retry_budget": "shared" if limit_settings.shared else "per-process",
                 "key_rpm": KEY_LIMIT.requests_per_minute,
                 "key_tpm": KEY_LIMIT.tokens_per_minute,
                 "account_rpm": ACCOUNT_LIMIT.requests_per_minute,

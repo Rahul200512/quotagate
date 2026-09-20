@@ -96,10 +96,83 @@ class RetryBudget:
     def record_request(self) -> None:
         self.tokens = min(self.burst, self.tokens + self.ratio)
 
-    def try_spend(self) -> bool:
+    async def try_spend(self) -> bool:
         # Repeated additions of a ratio like 0.2 drift below the integer they
         # should land on, and a bare `< 1` would swallow the retry they paid for.
         if self.tokens < 1 - 1e-9:
             return False
         self.tokens = max(0.0, self.tokens - 1)
         return True
+
+
+# ARGV: now, retries_per_minute, burst, ttl
+SPEND_RETRY = """
+local now = tonumber(ARGV[1])
+local rpm = tonumber(ARGV[2])
+local burst = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+local rate = rpm / 60.0
+
+local state = redis.call('HMGET', KEYS[1], 'tokens', 'updated')
+local tokens = tonumber(state[1])
+if tokens == nil then tokens = burst end
+local updated = tonumber(state[2]) or now
+local filled = tokens + (now - updated) * rate
+if filled > burst then filled = burst end
+
+if filled < 1 then
+  redis.call('HSET', KEYS[1], 'tokens', tostring(filled), 'updated', tostring(now))
+  redis.call('EXPIRE', KEYS[1], ttl)
+  return 0
+end
+
+redis.call('HSET', KEYS[1], 'tokens', tostring(filled - 1), 'updated', tostring(now))
+redis.call('EXPIRE', KEYS[1], ttl)
+return 1
+"""
+
+
+class SharedRetryBudget:
+    """One retry allowance for the whole deployment, held in Redis.
+
+    The per-process budget earns from traffic: every request adds a fraction of
+    a retry. Shared, that rule would cost a Redis write on every single
+    request — paying a round trip on the happy path to police the unhappy one.
+
+    So the shared budget refills with time instead: a flat ceiling of retries a
+    minute, consulted only when a retry is actually about to happen. Under
+    steady traffic the two rules land in the same place; under a burst the
+    time-based one is stricter, which is the direction to be wrong in.
+
+    A Redis that cannot be reached means no retry. The retry is the optional
+    half of the request — the first attempt has already been made — so failing
+    to reach the limiter must not turn one failing call into two.
+    """
+
+    def __init__(
+        self,
+        transport,
+        retries_per_minute: float = 12.0,
+        burst: float = 5.0,
+        namespace: str = "qg",
+    ) -> None:
+        self._transport = transport
+        self._rpm = retries_per_minute
+        self._burst = burst
+        self._key = f"{namespace}:retrybudget"
+
+    def record_request(self) -> None:
+        """Nothing to record: this budget refills from the clock, not traffic."""
+
+    async def try_spend(self) -> bool:
+        import time as _time
+
+        try:
+            raw = await self._transport.eval(
+                SPEND_RETRY,
+                [self._key],
+                [f"{_time.time():.6f}", str(self._rpm), str(self._burst), "180"],
+            )
+        except Exception:
+            return False
+        return bool(int(raw.decode() if isinstance(raw, (bytes, bytearray)) else raw))

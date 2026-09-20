@@ -18,6 +18,7 @@ only faster.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import time
@@ -99,3 +100,52 @@ class InMemoryCache:
         self._entries.move_to_end(key)
         while len(self._entries) > self._max:
             self._entries.popitem(last=False)
+
+
+class RedisCache:
+    """One cache for every copy of the service.
+
+    On Vercel this is the difference between a cache and a coincidence: without
+    it, a hit needs the same instance to answer both calls, and instances come
+    and go per request.
+
+    Bodies are base64'd inside a small JSON envelope. SSE frames are text, but
+    a provider is free to send bytes that are not valid UTF-8, and a cache that
+    corrupts one reply in ten thousand is worse than no cache at all.
+    """
+
+    def __init__(self, transport, namespace: str = "qg") -> None:
+        self._transport = transport
+        self._namespace = namespace
+
+    def _key(self, key: str) -> str:
+        return f"{self._namespace}:cache:{key}"
+
+    async def get(self, key: str) -> Entry | None:
+        raw = await self._transport.command("GET", self._key(key))
+        if not raw:
+            return None
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode()
+        try:
+            envelope = json.loads(raw)
+            return Entry(
+                body=base64.b64decode(envelope["b"]),
+                streamed=bool(envelope["s"]),
+                status=int(envelope["st"]),
+            )
+        except (ValueError, KeyError, TypeError):
+            # A malformed entry is a cache miss, not an error: the request can
+            # still be answered by asking the provider.
+            return None
+
+    async def set(self, key: str, entry: Entry, ttl: int) -> None:
+        envelope = json.dumps(
+            {
+                "b": base64.b64encode(entry.body).decode(),
+                "s": entry.streamed,
+                "st": entry.status,
+            },
+            separators=(",", ":"),
+        )
+        await self._transport.command("SET", self._key(key), envelope, "EX", str(ttl))
